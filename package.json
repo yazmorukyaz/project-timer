@@ -1,0 +1,89 @@
+{
+  "name": "project-timer",
+  "displayName": "Project Timer",
+  "description": "Track time spent on projects with enterprise-level dashboard",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "project-timer.showDashboard",
+        "title": "Project Timer: Show Dashboard"
+      },
+      {
+        "command": "project-timer.startTracking",
+        "title": "Project Timer: Start Tracking"
+      },
+      {
+        "command": "project-timer.stopTracking",
+        "title": "Project Timer: Stop Tracking"
+      },
+      {
+        "command": "project-timer.resetToday",
+        "title": "Project Timer: Reset Today's Stats"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "project-timer",
+          "title": "Project Timer",
+          "icon": "resources/time-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "project-timer": [
+        {
+          "id": "projectTimerDashboard",
+          "name": "Dashboard"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Project Timer",
+      "properties": {
+        "projectTimer.inactivityThreshold": {
+          "type": "number",
+          "default": 10,
+          "description": "Number of minutes of inactivity before stopping timer"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "test-compile": "tsc -p ./",
+    "test-watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "start": "code --disable-extensions --extensionDevelopmentPath=\"$PWD\" .",
+    "vsix": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^16.x",
+    "@types/vscode": "^1.60.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@vscode/vsce": "^3.3.2",
+    "eslint": "^8.45.0",
+    "ts-loader": "^9.4.4",
+    "typescript": "^5.1.6",
+    "webpack": "^5.88.2",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "chart.js": "^4.0.0"
+  }
+}
