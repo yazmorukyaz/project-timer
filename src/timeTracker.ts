@@ -47,6 +47,7 @@ export class TimeTracker {
     private startTime: number = 0;
     private timeoutId: NodeJS.Timeout | null = null;
     private activityTimeout: NodeJS.Timeout | null = null;
+    private activityDebounceTimeout: NodeJS.Timeout | null = null;
     private lastActivityTime: number = Date.now();
     private projectData: { [projectName: string]: ProjectTime } = {};
     private dailyData: { [date: string]: DailyRecord } = {};
@@ -428,14 +429,36 @@ export class TimeTracker {
     }
 
     private setupActivityDetection(): void {
-        // Track document changes and editor focus
-        vscode.workspace.onDidChangeTextDocument(() => this.onActivity());
-        vscode.window.onDidChangeActiveTextEditor(() => this.onActivity());
-        vscode.window.onDidChangeWindowState(e => {
-            if (e.focused) {
-                this.onActivity();
-            }
-        });
+        // Track document changes and editor focus using event disposables
+        // to ensure proper cleanup and less invasive monitoring
+        this.context.subscriptions.push(
+            vscode.workspace.onDidChangeTextDocument(() => {
+                // Debounce activity detection to prevent interference with operations like paste
+                this.debounceActivity();
+            }),
+            vscode.window.onDidChangeActiveTextEditor(() => {
+                // Debounce activity detection
+                this.debounceActivity();
+            }),
+            vscode.window.onDidChangeWindowState(e => {
+                if (e.focused) {
+                    // Debounce activity detection
+                    this.debounceActivity();
+                }
+            })
+        );
+    }
+
+    private debounceActivity(): void {
+        // Clear previous timeout to prevent multiple calls
+        if (this.activityDebounceTimeout) {
+            clearTimeout(this.activityDebounceTimeout);
+        }
+        
+        // Debounce activity detection to prevent interference with clipboard operations
+        this.activityDebounceTimeout = setTimeout(() => {
+            this.onActivity();
+        }, 300); // 300ms debounce time
     }
 
     private onActivity(): void {
@@ -503,6 +526,10 @@ export class TimeTracker {
         
         if (this.activityTimeout) {
             clearTimeout(this.activityTimeout);
+        }
+        
+        if (this.activityDebounceTimeout) {
+            clearTimeout(this.activityDebounceTimeout);
         }
         
         // Make sure to save data when disposing
