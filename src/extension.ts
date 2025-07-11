@@ -45,8 +45,54 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.window.showInformationMessage('Project Timer: Reset today\'s stats');
         }),
         vscode.commands.registerCommand('project-timer.resumeTracking', () => {
-            timeTracker.startTracking();
+            timeTracker.resumeTracking();
             vscode.window.showInformationMessage('Project Timer: Resumed tracking');
+        }),
+
+        vscode.commands.registerCommand('project-timer.togglePomodoro', () => {
+            timeTracker.togglePomodoro();
+        }),
+
+        vscode.commands.registerCommand('project-timer.showGoalProgress', () => {
+            const goalProgress = timeTracker.getGoalProgress();
+
+            const formatTime = (seconds: number): string => {
+                if (seconds === 0) return '0m';
+                const hours = Math.floor(seconds / 3600);
+                const minutes = Math.floor((seconds % 3600) / 60);
+                return `${hours > 0 ? `${hours}h ` : ''}${minutes}m`;
+            };
+
+            const dailySpent = formatTime(goalProgress.daily.spent);
+            const dailyGoal = formatTime(goalProgress.daily.goal);
+            const dailyPercent = Math.floor(goalProgress.daily.percentage);
+
+            const weeklySpent = formatTime(goalProgress.weekly.spent);
+            const weeklyGoal = formatTime(goalProgress.weekly.goal);
+            const weeklyPercent = Math.floor(goalProgress.weekly.percentage);
+
+            vscode.window.showInformationMessage(
+                `Daily Goal: ${dailySpent} / ${dailyGoal} (${dailyPercent}%) | Weekly Goal: ${weeklySpent} / ${weeklyGoal} (${weeklyPercent}%)`,
+                { modal: false }
+            );
+        }),
+
+        vscode.commands.registerCommand('project-timer.switchProject', async () => {
+            const projectData = timeTracker.getProjectData();
+            const projectItems: vscode.QuickPickItem[] = Object.values(projectData).map(p => ({
+                label: p.projectName,
+                description: p.projectPath,
+                detail: `Total time: ${Math.floor(p.totalTime / 3600)}h ${Math.floor((p.totalTime % 3600) / 60)}m`
+            }));
+
+            const selectedProject = await vscode.window.showQuickPick(projectItems, {
+                placeHolder: 'Select a project to open',
+            });
+
+            if (selectedProject && selectedProject.description) {
+                const projectUri = vscode.Uri.file(selectedProject.description);
+                vscode.commands.executeCommand('vscode.openFolder', projectUri, { forceNewWindow: true });
+            }
         })
     );
     

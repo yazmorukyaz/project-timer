@@ -2,557 +2,311 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
+// Data structure interfaces
 export interface TimeEntry {
     projectName: string;
     startTime: number;
     endTime: number;
-    duration: number;
-    tags?: string[];
-    category?: string;
-    description?: string;
+    duration: number; // in seconds
 }
 
 export interface ProjectTime {
     projectName: string;
-    totalTime: number;
+    projectPath: string;
+    totalTime: number; // in seconds
     entries: TimeEntry[];
-    categories?: { [category: string]: number };
-    tags?: { [tag: string]: number };
-    productivity?: number; // 0-100 productivity score
     lastActive?: number;
 }
 
 export interface DailyRecord {
     date: string;
-    projects: { [projectName: string]: number };
-    totalTime: number;
-    productivity?: number; // 0-100 productivity score
-    focusTime?: number; // Time spent in deep focus (long stretches)
-    breakTime?: number; // Time spent on breaks
+    projects: { [projectName: string]: number }; // time in seconds
+    totalTime: number; // in seconds
 }
 
 export interface ProjectStatistics {
     averageDailyTime: number;
     peakDay: { date: string; time: number };
-    mostProductiveTime: { hour: number; productivity: number };
-    focusRating: number; // 0-100 focus score
-    trend: number[]; // Recent trend in time spent
-    tags: { tag: string; time: number }[];
+    trend: number[]; // Last 7 days trend
 }
 
 export class TimeTracker {
     private context: vscode.ExtensionContext;
     private isTracking: boolean = false;
     private currentProject: string = '';
+    private currentProjectPath: string = '';
     private startTime: number = 0;
-    private timeoutId: NodeJS.Timeout | null = null;
+    private lastActivityTime: number;
+
+    // Timers
+    private saveDataInterval: NodeJS.Timeout | null = null;
     private activityTimeout: NodeJS.Timeout | null = null;
     private activityDebounceTimeout: NodeJS.Timeout | null = null;
-    private lastActivityTime: number = Date.now();
+    private pomodoroTimeout: NodeJS.Timeout | null = null;
+
+    // Data stores
     private projectData: { [projectName: string]: ProjectTime } = {};
     private dailyData: { [date: string]: DailyRecord } = {};
     private readonly dataFilePath: string;
-    private readonly dailyFilePath: string;
-    private readonly inactivityThreshold: number;
-    private autoResume: boolean;
-    private enablePomodoro: boolean;
-    private workDuration: number;
-    private breakDuration: number;
-    private pomodoroTimeout: NodeJS.Timeout | null = null;
+
+    // Configuration settings
+    private inactivityThreshold!: number; 
+    private autoResume!: boolean;
+    private autoResumeDelay!: number;
+    private enablePomodoro!: boolean;
+    private workDuration!: number;
+    private breakDuration!: number;
+    private dailyGoalHours!: number;
+    private weeklyGoalHours!: number;
     private inBreak: boolean = false;
-    private projectStatistics: { [projectName: string]: ProjectStatistics } = {};
-    
+
     private onDataChangedCallbacks: Array<() => void> = [];
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
-        this.inactivityThreshold = vscode.workspace.getConfiguration('projectTimer').get('inactivityThreshold', 10);
-        this.autoResume = vscode.workspace.getConfiguration('projectTimer').get('autoResume', true);
-        this.enablePomodoro = vscode.workspace.getConfiguration('projectTimer').get('enablePomodoro', false);
-        this.workDuration = vscode.workspace.getConfiguration('projectTimer').get('workDuration', 25);
-        this.breakDuration = vscode.workspace.getConfiguration('projectTimer').get('breakDuration', 5);
-        
-        // Create storage folder if it doesn't exist
+        this.lastActivityTime = Date.now();
+
         const storageFolder = context.globalStorageUri.fsPath;
         if (!fs.existsSync(storageFolder)) {
             fs.mkdirSync(storageFolder, { recursive: true });
         }
-        
         this.dataFilePath = path.join(storageFolder, 'project-time-data.json');
-        this.dailyFilePath = path.join(storageFolder, 'daily-time-data.json');
-        
-        // Load existing data
+
+        this.loadConfig();
         this.loadData();
-        
-        // Setup activity detection
         this.setupActivityDetection();
-        
-        // Save data periodically (every minute)
-        this.timeoutId = setInterval(() => this.saveData(), 60000);
+
+        this.saveDataInterval = setInterval(() => this.saveData(), 60000);
+
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('projectTimer')) {
+                this.loadConfig();
+                this.notifyDataChanged();
+            }
+        });
+    }
+
+    private loadConfig(): void {
+        const config = vscode.workspace.getConfiguration('projectTimer');
+        this.inactivityThreshold = config.get('inactivityThreshold', 10);
+        this.autoResume = config.get('autoResume', true);
+        this.autoResumeDelay = config.get('autoResumeDelay', 2);
+        this.enablePomodoro = config.get('enablePomodoro', false);
+        this.workDuration = config.get('workDuration', 25);
+        this.breakDuration = config.get('breakDuration', 5);
+        this.dailyGoalHours = config.get('dailyGoalHours', 0);
+        this.weeklyGoalHours = config.get('weeklyGoalHours', 0);
     }
 
     public startTracking(): void {
-        // Start Pomodoro cycle only once per session
-        if (this.enablePomodoro && !this.pomodoroTimeout) {
-            this.startPomodoroCycle();
-        }
-        if (this.isTracking) {
-            return;
-        }
-        
-        // Get current project name
+        if (this.isTracking) return;
+
         this.updateCurrentProject();
-        
         if (!this.currentProject) {
             vscode.window.showWarningMessage('No active project detected. Time will not be tracked.');
             return;
         }
-        
+
         this.isTracking = true;
         this.startTime = Date.now();
         this.lastActivityTime = this.startTime;
-        
-        // Initialize project statistics if needed
-        this.initializeProjectStatistics(this.currentProject);
-        
-        // Notify listeners
+
+        if (this.enablePomodoro && !this.pomodoroTimeout) {
+            this.startPomodoroCycle();
+        }
+
         this.notifyDataChanged();
     }
 
     public stopTracking(): void {
-        // Stop Pomodoro cycle when tracking stops
-        this.stopPomodoroCycle();
-        if (!this.isTracking) {
-            return;
+        if (!this.isTracking) return;
+
+        const endTime = Date.now();
+        const duration = (endTime - this.startTime) / 1000; // seconds
+
+        if (this.currentProject && this.startTime > 0 && duration > 1) {
+            this.addTimeEntry(this.currentProject, this.startTime, endTime, duration);
         }
-        
+
         this.isTracking = false;
-        
-        // Record time entry
-        if (this.currentProject && this.startTime > 0) {
-            const endTime = Date.now();
-            const duration = (endTime - this.startTime) / 1000; // in seconds
-            
-            // Only log if more than 1 second was spent
-            if (duration > 1) {
-                this.addTimeEntry(this.currentProject, this.startTime, endTime, duration);
-            }
-        }
-        
         this.startTime = 0;
-        
-        // Notify listeners
+        this.stopPomodoroCycle();
         this.notifyDataChanged();
     }
-    
-    public resetToday(): void {
-        const today = this.getTodayString();
-        
-        // Reset daily data
-        if (this.dailyData[today]) {
-            delete this.dailyData[today];
+
+    public resumeTracking(): void {
+        if (!this.isTracking) {
+            // Ensure we have a current project before resuming
+            this.updateCurrentProject();
+            if (this.currentProject && this.currentProject !== 'No Project') {
+                this.startTracking();
+            } else {
+                vscode.window.showWarningMessage(
+                    'Cannot resume tracking: No active project detected.',
+                    { modal: false }
+                );
+            }
         }
-        
-        // Remove today's entries from project data
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        const todayStartMs = todayStart.getTime();
-        
+    }
+
+    public resetToday(): void {
+        const todayStr = this.getTodayString();
+        const todayStartMs = new Date(todayStr).getTime();
+
+        if (this.dailyData[todayStr]) {
+            delete this.dailyData[todayStr];
+        }
+
         Object.keys(this.projectData).forEach(projectName => {
             const project = this.projectData[projectName];
             project.entries = project.entries.filter(entry => entry.startTime < todayStartMs);
-            
-            // Recalculate total time
             project.totalTime = project.entries.reduce((sum, entry) => sum + entry.duration, 0);
         });
-        
-        // Save updated data
+
         this.saveData();
-        
-        // Notify listeners
         this.notifyDataChanged();
     }
 
-    public getProjectData(): { [projectName: string]: ProjectTime } {
-        return { ...this.projectData };
-    }
-    
-    public getDailyData(): { [date: string]: DailyRecord } {
-        return { ...this.dailyData };
-    }
-    
-    public getCurrentProject(): string {
-        return this.currentProject;
-    }
-    
-    public isCurrentlyTracking(): boolean {
-        return this.isTracking;
-    }
-    
-    public getCurrentSessionTime(): number {
-        if (!this.isTracking || this.startTime === 0) {
-            return 0;
-        }
-        
-        return (Date.now() - this.startTime) / 1000; // in seconds
-    }
-    
-    public getTodayTotalTime(): number {
-        const today = this.getTodayString();
-        return this.dailyData[today]?.totalTime || 0;
-    }
-    
-    public getTodayProjectTime(projectName: string): number {
-        const today = this.getTodayString();
-        return this.dailyData[today]?.projects[projectName] || 0;
-    }
-    
-    public registerDataChangeListener(callback: () => void): void {
-        this.onDataChangedCallbacks.push(callback);
-    }
-
     private addTimeEntry(projectName: string, startTime: number, endTime: number, duration: number): void {
-        // Create project data if it doesn't exist
         if (!this.projectData[projectName]) {
+            // Ensure we have a path before creating the project entry
+            if (!this.currentProjectPath) {
+                console.error('Cannot create a new project entry without a path.');
+                return;
+            }
             this.projectData[projectName] = {
                 projectName,
+                projectPath: this.currentProjectPath,
                 totalTime: 0,
                 entries: [],
-                categories: {},
-                tags: {},
-                productivity: 75, // Default productivity score
                 lastActive: Date.now()
             };
         }
-        
-        // Add time entry
-        const entry: TimeEntry = {
-            projectName,
-            startTime,
-            endTime,
-            duration,
-            category: this.detectCategory(projectName, duration)
-        };
-        
+
+        const entry: TimeEntry = { projectName, startTime, endTime, duration };
         this.projectData[projectName].entries.push(entry);
         this.projectData[projectName].totalTime += duration;
         this.projectData[projectName].lastActive = Date.now();
-        
-        // Update category data
-        if (entry.category) {
-            if (!this.projectData[projectName].categories) {
-                this.projectData[projectName].categories = {};
-            }
-            
-            if (!this.projectData[projectName].categories[entry.category]) {
-                this.projectData[projectName].categories[entry.category] = 0;
-            }
-            
-            this.projectData[projectName].categories[entry.category] += duration;
-        }
-        
-        // Update daily data
-        const date = new Date(startTime);
-        const dateString = this.getDateString(date);
-        
+
+        const dateString = this.getDateString(new Date(startTime));
         if (!this.dailyData[dateString]) {
-            this.dailyData[dateString] = {
-                date: dateString,
-                projects: {},
-                totalTime: 0,
-                productivity: 75, // Default productivity score
-                focusTime: 0
-            };
+            this.dailyData[dateString] = { date: dateString, projects: {}, totalTime: 0 };
         }
-        
+
         if (!this.dailyData[dateString].projects[projectName]) {
             this.dailyData[dateString].projects[projectName] = 0;
         }
-        
+
         this.dailyData[dateString].projects[projectName] += duration;
         this.dailyData[dateString].totalTime += duration;
-        
-        // Calculate focus time - sessions over 25 minutes are considered focus time
-        if (duration > 25 * 60) {
-            if (!this.dailyData[dateString].focusTime) {
-                this.dailyData[dateString].focusTime = 0;
-            }
-            this.dailyData[dateString].focusTime += duration;
-        }
-        
-        // Update project statistics
-        this.updateProjectStatistics(projectName);
-        
-        // Save data
+
         this.saveData();
     }
 
-    /**
-     * Intelligently detects the category of work based on project and duration
-     */
-    private detectCategory(projectName: string, duration: number): string {
-        // Based on duration, make intelligent guesses
-        if (duration < 5 * 60) {
-            return 'Quick Task';
-        } else if (duration < 25 * 60) {
-            return 'Development';
-        } else if (duration < 60 * 60) {
-            return 'Deep Work';
-        } else {
-            return 'Extended Session';
-        }
-    }
-    
-    /**
-     * Initializes project statistics for new projects
-     */
-    private initializeProjectStatistics(projectName: string): void {
-        if (!this.projectStatistics[projectName]) {
-            this.projectStatistics[projectName] = {
-                averageDailyTime: 0,
-                peakDay: { date: this.getTodayString(), time: 0 },
-                mostProductiveTime: { hour: new Date().getHours(), productivity: 75 },
-                focusRating: 0,
-                trend: [0, 0, 0, 0, 0, 0, 0], // Last 7 days trend
-                tags: []
-            };
-        }
-    }
-    
-    /**
-     * Updates project statistics with AI-driven insights
-     */
-    private updateProjectStatistics(projectName: string): void {
-        this.initializeProjectStatistics(projectName);
-        
-        const project = this.projectData[projectName];
-        const stats = this.projectStatistics[projectName];
-        
-        // Calculate average daily time
-        const activeDays = Object.keys(this.dailyData).filter(
-            date => this.dailyData[date].projects[projectName]
-        ).length;
-        
-        stats.averageDailyTime = activeDays > 0 
-            ? project.totalTime / activeDays
-            : project.totalTime;
-        
-        // Find peak day
-        Object.keys(this.dailyData).forEach(date => {
-            const timeOnDay = this.dailyData[date].projects[projectName] || 0;
-            if (timeOnDay > stats.peakDay.time) {
-                stats.peakDay = { date, time: timeOnDay };
+    // --- Data Accessors ---
+    public getProjectData = () => ({ ...this.projectData });
+    public getDailyData = () => ({ ...this.dailyData });
+    public getCurrentProject = () => this.currentProject;
+    public isCurrentlyTracking = () => this.isTracking;
+    public getCurrentSessionTime = () => (this.isTracking && this.startTime > 0) ? (Date.now() - this.startTime) / 1000 : 0;
+    public getTodayTotalTime = () => this.dailyData[this.getTodayString()]?.totalTime || 0;
+
+    public getGoalProgress() {
+        const now = new Date();
+        const dayOfWeek = now.getDay(); // Sunday - 0, Monday - 1, ...
+        const startOfWeek = new Date(now);
+        startOfWeek.setDate(now.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1)); // Monday as start of week
+        startOfWeek.setHours(0, 0, 0, 0);
+
+        const weeklyRecords = Object.values(this.dailyData).filter(record => new Date(record.date) >= startOfWeek);
+        const weeklyTotal = weeklyRecords.reduce((sum, record) => sum + record.totalTime, 0);
+        const dailyTotal = this.getTodayTotalTime();
+
+        const dailyGoalSeconds = this.dailyGoalHours * 3600;
+        const weeklyGoalSeconds = this.weeklyGoalHours * 3600;
+
+        return {
+            daily: {
+                spent: dailyTotal,
+                goal: dailyGoalSeconds,
+                percentage: dailyGoalSeconds > 0 ? (dailyTotal / dailyGoalSeconds) * 100 : 0
+            },
+            weekly: {
+                spent: weeklyTotal,
+                goal: weeklyGoalSeconds,
+                percentage: weeklyGoalSeconds > 0 ? (weeklyTotal / weeklyGoalSeconds) * 100 : 0
             }
-        });
-        
-        // Calculate focus rating (0-100) based on session length patterns
-        const focusTimeTotal = project.entries.reduce((sum, entry) => {
-            return sum + (entry.duration > 25 * 60 ? entry.duration : 0);
-        }, 0);
-        
-        stats.focusRating = project.totalTime > 0 
-            ? Math.min(100, Math.round((focusTimeTotal / project.totalTime) * 100))
-            : 0;
-        
-        // Update trend (last 7 days)
-        const last7Days = this.getLast7Days();
-        stats.trend = last7Days.map(date => {
-            return this.dailyData[date]?.projects[projectName] || 0;
-        });
-    }
-    
-    /**
-     * Gets the dates of the last 7 days
-     */
-    private getLast7Days(): string[] {
-        const dates: string[] = [];
-        for (let i = 0; i < 7; i++) {
-            const date = new Date();
-            date.setDate(date.getDate() - i);
-            const dateString = this.getDateString(date);
-            dates.push(dateString);
-        }
-        return dates;
+        };
     }
 
-    /**
-     * Gets project statistics
-     */
-    public getProjectStatistics(projectName: string): ProjectStatistics | null {
-        if (!this.projectStatistics[projectName]) {
-            this.initializeProjectStatistics(projectName);
-        }
-        
-        return this.projectStatistics[projectName];
-    }
-    
-    /**
-     * Gets AI-driven productivity insights
-     */
-    public getProductivityInsights(projectName: string): string[] {
-        const stats = this.getProjectStatistics(projectName);
-        const project = this.projectData[projectName];
-        
-        if (!stats || !project) {
-            return ['Not enough data to generate insights yet.'];
-        }
-        
-        const insights: string[] = [];
-        
-        // Focus time insight
-        if (stats.focusRating < 30) {
-            insights.push('Consider using the Pomodoro technique to improve focus time.');
-        } else if (stats.focusRating > 70) {
-            insights.push('Great job maintaining focus during work sessions!');
-        }
-        
-        // Trend insight
-        const trend = stats.trend.filter(t => t > 0);
-        if (trend.length >= 3) {
-            const isIncreasing = trend[0] > trend[trend.length - 1];
-            if (isIncreasing) {
-                insights.push('Your time investment in this project is increasing. Keep up the momentum!');
-            } else {
-                insights.push('Your time investment has been decreasing. Consider allocating more time if this is a priority project.');
-            }
-        }
-        
-        // Session length insight
-        const averageSession = project.entries.reduce((sum, entry) => sum + entry.duration, 0) / project.entries.length;
-        if (averageSession < 15 * 60) {
-            insights.push('Your sessions are relatively short. Consider blocking longer periods for deeper work.');
-        } else if (averageSession > 60 * 60) {
-            insights.push('You have long work sessions. Remember to take breaks to maintain productivity.');
-        }
-        
-        return insights.length > 0 ? insights : ['Continue tracking to generate more personalized insights.'];
-    }
-
-    private updateCurrentProject(): void {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        
-        if (!workspaceFolders || workspaceFolders.length === 0) {
-            // Use a default project name if no workspace is open
-            if (!this.currentProject) {
-                this.currentProject = 'Default Project';
-                console.log('No workspace detected, using default project name');
-            }
-            return;
-        }
-        
-        // For simplicity, use the first workspace folder as the project
-        this.currentProject = workspaceFolders[0].name;
-    }
-
+    // --- Activity Detection ---
     private setupActivityDetection(): void {
-        // Track document changes and editor focus using event disposables
-        // to ensure proper cleanup and less invasive monitoring
+        const onActivity = () => {
+            if (this.activityDebounceTimeout) clearTimeout(this.activityDebounceTimeout);
+            this.activityDebounceTimeout = setTimeout(() => this.onActivity(), 1000);
+        };
+
         this.context.subscriptions.push(
-            vscode.workspace.onDidChangeTextDocument(() => {
-                // Debounce activity detection to prevent interference with operations like paste
-                this.debounceActivity();
-            }),
-            vscode.window.onDidChangeActiveTextEditor(() => {
-                // Debounce activity detection
-                this.debounceActivity();
-            }),
-            vscode.window.onDidChangeWindowState(e => {
-                if (e.focused) {
-                    // Debounce activity detection
-                    this.debounceActivity();
-                }
-            })
+            // Document and editor events
+            vscode.workspace.onDidChangeTextDocument(onActivity),
+            vscode.window.onDidChangeActiveTextEditor(onActivity),
+            vscode.window.onDidChangeWindowState(onActivity),
+            vscode.window.onDidChangeTextEditorSelection(onActivity),
+            vscode.window.onDidChangeActiveColorTheme(onActivity),
+            vscode.window.onDidChangeTextEditorViewColumn(onActivity),
+            
+            // Workspace events
+            vscode.workspace.onDidOpenTextDocument(onActivity),
+            vscode.workspace.onDidCloseTextDocument(onActivity),
+            vscode.workspace.onDidSaveTextDocument(onActivity),
+            vscode.workspace.onDidChangeWorkspaceFolders(onActivity),
+            
+            // Terminal events
+            vscode.window.onDidOpenTerminal(onActivity),
+            vscode.window.onDidCloseTerminal(onActivity)
         );
     }
 
-    private debounceActivity(): void {
-        // Clear previous timeout to prevent multiple calls
-        if (this.activityDebounceTimeout) {
-            clearTimeout(this.activityDebounceTimeout);
-        }
-        
-        // Debounce activity detection to prevent interference with clipboard operations
-        this.activityDebounceTimeout = setTimeout(() => {
-            this.onActivity();
-        }, 300); // 300ms debounce time
-    }
-
     private onActivity(): void {
-        // If tracking was paused due to inactivity, optionally resume
-        if (!this.isTracking && this.autoResume) {
-            console.log('Activity detected, resuming timer.');
-            this.startTracking();
-        }
         this.lastActivityTime = Date.now();
-        
-        // Clear previous timeout
-        if (this.activityTimeout) {
-            clearTimeout(this.activityTimeout);
+
+        // Auto-resume with delay if not currently tracking
+        if (!this.isTracking && this.autoResume) {
+            // Add a small delay before auto-resuming to avoid false triggers
+            setTimeout(() => {
+                if (!this.isTracking && this.autoResume) {
+                    this.resumeTracking();
+                    vscode.window.showInformationMessage(
+                        `Activity detected - auto-resuming timer for ${this.currentProject}`,
+                        { modal: false }
+                    );
+                }
+            }, this.autoResumeDelay * 1000);
         }
-        
-        // Set new timeout for inactivity (in milliseconds)
+
+        // Reset inactivity timer
+        if (this.activityTimeout) clearTimeout(this.activityTimeout);
+
         this.activityTimeout = setTimeout(() => {
             if (this.isTracking) {
-                console.log(`Inactivity detected for ${this.inactivityThreshold} minutes, pausing timer.`);
+                vscode.window.showInformationMessage(
+                    `Inactivity detected, pausing timer for ${this.currentProject}.`,
+                    { modal: false }
+                );
                 this.stopTracking();
             }
         }, this.inactivityThreshold * 60 * 1000);
     }
 
-    private loadData(): void {
-        try {
-            if (fs.existsSync(this.dataFilePath)) {
-                const data = fs.readFileSync(this.dataFilePath, 'utf8');
-                this.projectData = JSON.parse(data);
-            }
-            
-            if (fs.existsSync(this.dailyFilePath)) {
-                const data = fs.readFileSync(this.dailyFilePath, 'utf8');
-                this.dailyData = JSON.parse(data);
-            }
-        } catch (err) {
-            console.error('Error loading project timer data:', err);
-            // Initialize with empty data if there's an error
-            this.projectData = {};
-            this.dailyData = {};
-        }
-    }
-
-    private saveData(): void {
-        try {
-            fs.writeFileSync(this.dataFilePath, JSON.stringify(this.projectData, null, 2));
-            fs.writeFileSync(this.dailyFilePath, JSON.stringify(this.dailyData, null, 2));
-        } catch (err) {
-            console.error('Error saving project timer data:', err);
-            vscode.window.showErrorMessage('Failed to save project timer data.');
-        }
-    }
-    
-    private getTodayString(): string {
-        return this.getDateString(new Date());
-    }
-    
-    private getDateString(date: Date): string {
-        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    }
-    
-    private notifyDataChanged(): void {
-        this.onDataChangedCallbacks.forEach(callback => callback());
-    }
-
-    /**
-     * Toggles Pomodoro mode via command.
-     */
+    // --- Pomodoro --- 
     public togglePomodoro(): void {
         this.enablePomodoro = !this.enablePomodoro;
         vscode.workspace.getConfiguration('projectTimer').update('enablePomodoro', this.enablePomodoro, true);
         if (this.enablePomodoro) {
-            vscode.window.showInformationMessage('Pomodoro enabled');
-            if (this.isTracking && !this.pomodoroTimeout) {
-                this.startPomodoroCycle();
-            }
+            vscode.window.showInformationMessage('Pomodoro enabled.');
+            if (this.isTracking) this.startPomodoroCycle();
         } else {
-            vscode.window.showInformationMessage('Pomodoro disabled');
+            vscode.window.showInformationMessage('Pomodoro disabled.');
             this.stopPomodoroCycle();
         }
     }
@@ -561,23 +315,18 @@ export class TimeTracker {
      * Starts a Pomodoro or break timer depending on state.
      */
     private startPomodoroCycle(): void {
-        // Clear any existing timeout just in case
-        if (this.pomodoroTimeout) {
-            clearTimeout(this.pomodoroTimeout);
-        }
-        const durationMs = (this.inBreak ? this.breakDuration : this.workDuration) * 60 * 1000;
+        if (this.pomodoroTimeout) clearTimeout(this.pomodoroTimeout);
+
+        const duration = this.inBreak ? this.breakDuration : this.workDuration;
+        const message = this.inBreak 
+            ? `Break's over! Time to get back to work.`
+            : `Time for a break! You've worked for ${this.workDuration} minutes.`;
+
         this.pomodoroTimeout = setTimeout(() => {
+            vscode.window.showInformationMessage(message, 'Ok');
             this.inBreak = !this.inBreak;
-            if (this.inBreak) {
-                vscode.window.showInformationMessage('Time for a break!');
-            } else {
-                vscode.window.showInformationMessage('Break over – back to work!');
-            }
-            // Continue cycle if still enabled and tracking
-            if (this.enablePomodoro && this.isTracking) {
-                this.startPomodoroCycle();
-            }
-        }, durationMs);
+            this.startPomodoroCycle();
+        }, duration * 60 * 1000);
     }
 
     /**
@@ -591,20 +340,54 @@ export class TimeTracker {
         this.inBreak = false;
     }
 
-    dispose(): void {
-        if (this.timeoutId) {
-            clearInterval(this.timeoutId);
+    // --- Data Persistence ---
+    private saveData(): void {
+        try {
+            const data = { projectData: this.projectData, dailyData: this.dailyData };
+            fs.writeFileSync(this.dataFilePath, JSON.stringify(data, null, 2));
+        } catch (error) {
+            console.error('Error saving project timer data:', error);
         }
-        
-        if (this.activityTimeout) {
-            clearTimeout(this.activityTimeout);
+    }
+
+    private loadData(): void {
+        try {
+            if (fs.existsSync(this.dataFilePath)) {
+                const rawData = fs.readFileSync(this.dataFilePath, 'utf-8');
+                const data = JSON.parse(rawData);
+                this.projectData = data.projectData || {};
+                this.dailyData = data.dailyData || {};
+            }
+        } catch (error) {
+            console.error('Error loading project timer data:', error);
+            this.projectData = {};
+            this.dailyData = {};
         }
-        
-        if (this.activityDebounceTimeout) {
-            clearTimeout(this.activityDebounceTimeout);
+    }
+
+    // --- Helpers ---
+    private updateCurrentProject(): void {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (workspaceFolders && workspaceFolders.length > 0) {
+            this.currentProjectPath = workspaceFolders[0].uri.fsPath;
+            this.currentProject = path.basename(this.currentProjectPath);
+        } else {
+            this.currentProject = 'No Project';
+            this.currentProjectPath = '';
         }
-        
-        // Make sure to save data when disposing
+    }
+
+    private getTodayString = () => this.getDateString(new Date());
+    private getDateString = (date: Date) => `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
+    public registerDataChangeListener = (callback: () => void) => this.onDataChangedCallbacks.push(callback);
+    private notifyDataChanged = () => this.onDataChangedCallbacks.forEach(cb => cb());
+
+    public dispose(): void {
+        this.stopTracking();
+        if (this.saveDataInterval) clearInterval(this.saveDataInterval);
+        if (this.activityTimeout) clearTimeout(this.activityTimeout);
+        if (this.activityDebounceTimeout) clearTimeout(this.activityDebounceTimeout);
+        if (this.pomodoroTimeout) clearTimeout(this.pomodoroTimeout);
         this.saveData();
     }
 }

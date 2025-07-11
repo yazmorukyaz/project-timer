@@ -27,21 +27,47 @@ export class StatusBarManager implements vscode.Disposable {
 
     private updateStatusBar(): void {
         const project = this.timeTracker.getCurrentProject();
-        
+
         if (!project) {
             this.statusBarItem.text = '$(watch) No active project';
+            this.statusBarItem.tooltip = 'Project Timer: No active project folder found.';
             return;
         }
-        
+
+        // Main status text
+        let text: string;
         if (this.timeTracker.isCurrentlyTracking()) {
             const sessionTime = this.formatTime(this.timeTracker.getCurrentSessionTime());
-            const todayTime = this.formatTime(this.timeTracker.getTodayProjectTime(project));
-            
-            this.statusBarItem.text = `$(clock) ${project}: ${sessionTime} (Today: ${todayTime})`;
+            const todayTotalTime = this.formatTime(this.timeTracker.getTodayTotalTime());
+            text = `$(clock) ${project}: ${sessionTime} (Today: ${todayTotalTime})`;
         } else {
-            const todayTime = this.formatTime(this.timeTracker.getTodayProjectTime(project));
-            this.statusBarItem.text = `$(watch) ${project}: ${todayTime} today (paused)`;
+            const todayTotalTime = this.formatTime(this.timeTracker.getTodayTotalTime());
+            text = `$(watch) ${project}: ${todayTotalTime} today (paused)`;
         }
+
+        // Goal progress text and tooltip
+        const goalProgress = this.timeTracker.getGoalProgress();
+        const dailyPercent = Math.floor(goalProgress.daily.percentage);
+        const weeklyPercent = Math.floor(goalProgress.weekly.percentage);
+
+        let goalText = '';
+        if (goalProgress.daily.goal > 0 || goalProgress.weekly.goal > 0) {
+            goalText = ` | $(target) D:${dailyPercent}% W:${weeklyPercent}%`;
+        }
+
+        this.statusBarItem.text = text + goalText;
+
+        const dailyGoalFormatted = this.formatTime(goalProgress.daily.goal);
+        const dailySpentFormatted = this.formatTime(goalProgress.daily.spent);
+        const weeklyGoalFormatted = this.formatTime(goalProgress.weekly.goal);
+        const weeklySpentFormatted = this.formatTime(goalProgress.weekly.spent);
+
+        this.statusBarItem.tooltip = new vscode.MarkdownString(
+            `**Project Timer**\n\n---\n\n` +
+            `**Today's Goal:** ${dailySpentFormatted} / ${dailyGoalFormatted} (${dailyPercent}%)\n\n` +
+            `**Weekly Goal:** ${weeklySpentFormatted} / ${weeklyGoalFormatted} (${weeklyPercent}%)\n\n---\n\n` +
+            `Click to show dashboard.`
+        );
     }
     
     private formatTime(seconds: number): string {

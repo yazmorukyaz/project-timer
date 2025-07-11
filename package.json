@@ -12,6 +12,8 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "browser": "./dist/web/extension.js",
+  "icon": "images/icon.png",
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -38,6 +40,10 @@
       {
         "command": "project-timer.togglePomodoro",
         "title": "Project Timer: Toggle Pomodoro"
+      },
+      {
+        "command": "project-timer.showGoalProgress",
+        "title": "Project Timer: Show Goal Progress"
       }
     ],
     "viewsContainers": {
@@ -70,6 +76,11 @@
           "default": true,
           "description": "Automatically resume tracking when activity is detected after a pause"
         },
+        "projectTimer.autoResumeDelay": {
+          "type": "number",
+          "default": 2,
+          "description": "Delay in seconds before auto-resuming tracking (prevents false triggers)"
+        },
         "projectTimer.enablePomodoro": {
           "type": "boolean",
           "default": false,
@@ -84,6 +95,16 @@
           "type": "number",
           "default": 5,
           "description": "Pomodoro break length in minutes"
+        },
+        "projectTimer.dailyGoalHours": {
+          "type": "number",
+          "default": 5,
+          "description": "Daily goal for hours spent on the current project"
+        },
+        "projectTimer.weeklyGoalHours": {
+          "type": "number",
+          "default": 25,
+          "description": "Weekly goal for hours spent on the current project"
         }
       }
     }
@@ -100,18 +121,20 @@
     "vsix": "vsce package"
   },
   "devDependencies": {
-    "@types/node": "^16.x",
-    "@types/vscode": "^1.60.0",
-    "@typescript-eslint/eslint-plugin": "^6.0.0",
-    "@typescript-eslint/parser": "^6.0.0",
-    "@vscode/vsce": "^3.3.2",
-    "eslint": "^8.45.0",
-    "ts-loader": "^9.4.4",
+    "@types/vscode": "^1.81.0",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "20.x",
+    "eslint": "^8.47.0",
     "typescript": "^5.1.6",
+    "@typescript-eslint/eslint-plugin": "^6.4.1",
+    "@typescript-eslint/parser": "^6.4.1",
+    "glob": "^10.3.3",
+    "mocha": "^10.2.0",
+    "ts-loader": "^9.4.4",
     "webpack": "^5.88.2",
     "webpack-cli": "^5.1.4"
   },
   "dependencies": {
-    "chart.js": "^4.0.0"
+    "chart.js": "^4.4.0"
   }
 }
