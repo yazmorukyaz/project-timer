@@ -30,6 +30,14 @@
       {
         "command": "project-timer.resetToday",
         "title": "Project Timer: Reset Today's Stats"
+      },
+      {
+        "command": "project-timer.resumeTracking",
+        "title": "Project Timer: Resume Now"
+      },
+      {
+        "command": "project-timer.togglePomodoro",
+        "title": "Project Timer: Toggle Pomodoro"
       }
     ],
     "viewsContainers": {
@@ -56,6 +64,26 @@
           "type": "number",
           "default": 10,
           "description": "Number of minutes of inactivity before stopping timer"
+        },
+        "projectTimer.autoResume": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically resume tracking when activity is detected after a pause"
+        },
+        "projectTimer.enablePomodoro": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Pomodoro reminders while tracking"
+        },
+        "projectTimer.workDuration": {
+          "type": "number",
+          "default": 25,
+          "description": "Pomodoro work session length in minutes"
+        },
+        "projectTimer.breakDuration": {
+          "type": "number",
+          "default": 5,
+          "description": "Pomodoro break length in minutes"
         }
       }
     }

@@ -43,6 +43,10 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('project-timer.resetToday', () => {
             timeTracker.resetToday();
             vscode.window.showInformationMessage('Project Timer: Reset today\'s stats');
+        }),
+        vscode.commands.registerCommand('project-timer.resumeTracking', () => {
+            timeTracker.startTracking();
+            vscode.window.showInformationMessage('Project Timer: Resumed tracking');
         })
     );
     

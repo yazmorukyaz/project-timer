@@ -54,6 +54,12 @@ export class TimeTracker {
     private readonly dataFilePath: string;
     private readonly dailyFilePath: string;
     private readonly inactivityThreshold: number;
+    private autoResume: boolean;
+    private enablePomodoro: boolean;
+    private workDuration: number;
+    private breakDuration: number;
+    private pomodoroTimeout: NodeJS.Timeout | null = null;
+    private inBreak: boolean = false;
     private projectStatistics: { [projectName: string]: ProjectStatistics } = {};
     
     private onDataChangedCallbacks: Array<() => void> = [];
@@ -61,6 +67,10 @@ export class TimeTracker {
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
         this.inactivityThreshold = vscode.workspace.getConfiguration('projectTimer').get('inactivityThreshold', 10);
+        this.autoResume = vscode.workspace.getConfiguration('projectTimer').get('autoResume', true);
+        this.enablePomodoro = vscode.workspace.getConfiguration('projectTimer').get('enablePomodoro', false);
+        this.workDuration = vscode.workspace.getConfiguration('projectTimer').get('workDuration', 25);
+        this.breakDuration = vscode.workspace.getConfiguration('projectTimer').get('breakDuration', 5);
         
         // Create storage folder if it doesn't exist
         const storageFolder = context.globalStorageUri.fsPath;
@@ -82,6 +92,10 @@ export class TimeTracker {
     }
 
     public startTracking(): void {
+        // Start Pomodoro cycle only once per session
+        if (this.enablePomodoro && !this.pomodoroTimeout) {
+            this.startPomodoroCycle();
+        }
         if (this.isTracking) {
             return;
         }
@@ -106,6 +120,8 @@ export class TimeTracker {
     }
 
     public stopTracking(): void {
+        // Stop Pomodoro cycle when tracking stops
+        this.stopPomodoroCycle();
         if (!this.isTracking) {
             return;
         }
@@ -462,6 +478,11 @@ export class TimeTracker {
     }
 
     private onActivity(): void {
+        // If tracking was paused due to inactivity, optionally resume
+        if (!this.isTracking && this.autoResume) {
+            console.log('Activity detected, resuming timer.');
+            this.startTracking();
+        }
         this.lastActivityTime = Date.now();
         
         // Clear previous timeout
@@ -517,6 +538,57 @@ export class TimeTracker {
     
     private notifyDataChanged(): void {
         this.onDataChangedCallbacks.forEach(callback => callback());
+    }
+
+    /**
+     * Toggles Pomodoro mode via command.
+     */
+    public togglePomodoro(): void {
+        this.enablePomodoro = !this.enablePomodoro;
+        vscode.workspace.getConfiguration('projectTimer').update('enablePomodoro', this.enablePomodoro, true);
+        if (this.enablePomodoro) {
+            vscode.window.showInformationMessage('Pomodoro enabled');
+            if (this.isTracking && !this.pomodoroTimeout) {
+                this.startPomodoroCycle();
+            }
+        } else {
+            vscode.window.showInformationMessage('Pomodoro disabled');
+            this.stopPomodoroCycle();
+        }
+    }
+
+    /**
+     * Starts a Pomodoro or break timer depending on state.
+     */
+    private startPomodoroCycle(): void {
+        // Clear any existing timeout just in case
+        if (this.pomodoroTimeout) {
+            clearTimeout(this.pomodoroTimeout);
+        }
+        const durationMs = (this.inBreak ? this.breakDuration : this.workDuration) * 60 * 1000;
+        this.pomodoroTimeout = setTimeout(() => {
+            this.inBreak = !this.inBreak;
+            if (this.inBreak) {
+                vscode.window.showInformationMessage('Time for a break!');
+            } else {
+                vscode.window.showInformationMessage('Break over – back to work!');
+            }
+            // Continue cycle if still enabled and tracking
+            if (this.enablePomodoro && this.isTracking) {
+                this.startPomodoroCycle();
+            }
+        }, durationMs);
+    }
+
+    /**
+     * Stops any active Pomodoro timer.
+     */
+    private stopPomodoroCycle(): void {
+        if (this.pomodoroTimeout) {
+            clearTimeout(this.pomodoroTimeout);
+            this.pomodoroTimeout = null;
+        }
+        this.inBreak = false;
     }
 
     dispose(): void {
