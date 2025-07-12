@@ -2,9 +2,19 @@
   "name": "project-timer",
   "displayName": "Project Timer",
   "description": "Track time spent on projects with enterprise-level dashboard",
-  "version": "0.1.0",
+  "version": "0.3.0",
+  "publisher": "project-timer-dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yazmorukyaz/project-timer"
+  },
+  "homepage": "https://github.com/yazmorukyaz/project-timer",
+  "bugs": {
+    "url": "https://github.com/yazmorukyaz/project-timer/issues"
+  },
+  "keywords": ["time tracking", "productivity", "git", "analytics", "focus time"],
   "engines": {
-    "vscode": "^1.60.0"
+    "vscode": "^1.81.0"
   },
   "categories": [
     "Other"
@@ -12,8 +22,6 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "browser": "./dist/web/extension.js",
-  "icon": "images/icon.png",
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [

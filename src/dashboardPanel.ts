@@ -13,6 +13,8 @@ export class DashboardPanel {
     private _disposables: vscode.Disposable[] = [];
     private _updateInterval: NodeJS.Timeout | null = null;
     private _analyticsEngine: AnalyticsEngine;
+    private _activeTab: string = 'overview';
+    private _htmlGenerated: boolean = false;
 
     /**
      * Creates or shows the dashboard panel
@@ -77,7 +79,7 @@ export class DashboardPanel {
 
         // Handle messages from the webview
         this._panel.webview.onDidReceiveMessage(
-            (message: { command: string; format?: string }) => {
+            (message: { command: string; format?: string; tab?: string }) => {
                 switch (message.command) {
                     case 'startTracking':
                         this._timeTracker.startTracking();
@@ -108,6 +110,15 @@ export class DashboardPanel {
                     case 'importData':
                         this._importData();
                         break;
+                    case 'tabChanged':
+                        if (message.tab) {
+                            this._activeTab = message.tab;
+                        }
+                        break;
+                    case 'updateData':
+                        // Just update dynamic data without changing HTML structure
+                        this._updateDynamicContent();
+                        break;
                 }
             },
             null,
@@ -121,10 +132,10 @@ export class DashboardPanel {
             }
         });
 
-        // Set up interval to update the panel
+        // Set up interval to update just the dynamic content (not full HTML)
         this._updateInterval = setInterval(() => {
             if (this._panel.visible && this._timeTracker.isCurrentlyTracking()) {
-                this._update();
+                this._updateDynamicContent();
             }
         }, 1000);
 
@@ -283,7 +294,7 @@ export class DashboardPanel {
     }
 
     /**
-     * Updates the webview content
+     * Updates the webview content (full HTML regeneration)
      */
     private _update(): void {
         if (!this._panel.visible) {
@@ -291,6 +302,37 @@ export class DashboardPanel {
         }
         
         this._panel.webview.html = this._getHtmlForWebview(this._panel.webview);
+        this._htmlGenerated = true;
+    }
+
+    /**
+     * Updates only dynamic content without regenerating HTML
+     */
+    private _updateDynamicContent(): void {
+        if (!this._panel.visible || !this._htmlGenerated) {
+            return;
+        }
+
+        const currentProject = this._timeTracker.getCurrentProject();
+        const isTracking = this._timeTracker.isCurrentlyTracking();
+        const sessionTime = this._timeTracker.getCurrentSessionTime();
+        const currentGitBranch = this._timeTracker.getCurrentGitBranch();
+        const currentFileType = this._timeTracker.getCurrentFileType();
+
+        // Send updated data to webview
+        this._panel.webview.postMessage({
+            command: 'updateDynamicData',
+            data: {
+                currentProject: currentProject || 'None',
+                isTracking,
+                sessionTime: this._formatTime(sessionTime),
+                gitBranch: currentGitBranch,
+                fileType: currentFileType,
+                focusTime: this._formatTime(this._timeTracker.getCurrentFocusTime()),
+                interruptions: this._timeTracker.getSessionInterruptions(),
+                activeTab: this._activeTab
+            }
+        });
     }
 
     /**
@@ -306,6 +348,50 @@ export class DashboardPanel {
     }
 
     /**
+     * Generates a consistent color for a project based on its name
+     */
+    private generateProjectColor(projectName: string): string {
+        const colors = [
+            '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
+            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF',
+            '#4BC0C0', '#36A2EB', '#FFCE56', '#9966FF'
+        ];
+        
+        let hash = 0;
+        for (let i = 0; i < projectName.length; i++) {
+            hash = ((hash << 5) - hash) + projectName.charCodeAt(i);
+            hash = hash & hash; // Convert to 32bit integer
+        }
+        
+        return colors[Math.abs(hash) % colors.length];
+    }
+
+    /**
+     * Generates hourly heatmap data for productivity visualization
+     */
+    private generateHourlyHeatmapData(dailyData: { [date: string]: any }): number[][] {
+        // Initialize 24x7 grid (hours x days of week)
+        const heatmapGrid: number[][] = Array(24).fill(null).map(() => Array(7).fill(0));
+        
+        Object.values(dailyData).forEach((day: any) => {
+            const dayOfWeek = new Date(day.date).getDay(); // 0 = Sunday
+            
+            // Distribute daily time across hours based on most productive hour
+            const mostProductiveHour = day.mostProductiveHour || 9;
+            const totalTime = day.totalTime / 3600; // Convert to hours
+            
+            // Create a distribution centered around the most productive hour
+            for (let hour = 0; hour < 24; hour++) {
+                const distance = Math.abs(hour - mostProductiveHour);
+                const weight = Math.max(0, 1 - (distance / 8)); // Weight decreases with distance
+                heatmapGrid[hour][dayOfWeek] += totalTime * weight;
+            }
+        });
+        
+        return heatmapGrid;
+    }
+
+    /**
      * Generates the HTML for the webview panel
      */
     private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -318,6 +404,8 @@ export class DashboardPanel {
         const currentProject = this._timeTracker.getCurrentProject();
         const isTracking = this._timeTracker.isCurrentlyTracking();
         const sessionTime = this._timeTracker.getCurrentSessionTime();
+        const commitHistory = this._timeTracker.getCommitHistory();
+        const commitStats = this._timeTracker.getCommitStats();
 
         let projectRows = Object.values(projectData).map(p => `
             <tr>
@@ -339,6 +427,30 @@ export class DashboardPanel {
             `;
         }).join('');
 
+        // Generate commit rows
+        let commitRows = commitHistory.slice(0, 20).map(commit => {
+            const productivityBadge = commit.productivity === 'high' ? 
+                '<span style="background: #4CAF50; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">High</span>' :
+                commit.productivity === 'medium' ? 
+                '<span style="background: #FF9800; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">Medium</span>' :
+                '<span style="background: #757575; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">Low</span>';
+            
+            return `
+                <tr>
+                    <td style="max-width: 300px; word-wrap: break-word;">
+                        <strong>${commit.message}</strong><br>
+                        <small style="color: var(--vscode-descriptionForeground);">${commit.commitHash.substring(0, 8)} • ${commit.author}</small>
+                    </td>
+                    <td>${commit.branch}</td>
+                    <td>${this._formatTime(commit.timeSpent)}</td>
+                    <td>${commit.filesChanged.length} files</td>
+                    <td>+${commit.linesAdded} -${commit.linesDeleted}</td>
+                    <td>${productivityBadge}</td>
+                    <td>${new Date(commit.date).toLocaleDateString()}</td>
+                </tr>
+            `;
+        }).join('');
+
         // Prepare data for charts
         const last7Days = Object.keys(dailyData)
             .map(d => ({ ...dailyData[d] }))
@@ -348,6 +460,33 @@ export class DashboardPanel {
 
         const weeklyChartLabels = last7Days.map(d => new Date(d.date).toLocaleDateString(undefined, { weekday: 'short' }));
         const weeklyChartData = last7Days.map(d => d.totalTime / 3600); // in hours
+
+        // Project distribution pie chart data
+        const projectTimeData = Object.values(projectData).map(p => ({
+            label: p.projectName,
+            value: p.totalTime / 3600,
+            color: this.generateProjectColor(p.projectName)
+        }));
+
+        // Commit productivity pie chart data
+        const productivityData = [
+            { label: 'High Productivity', value: commitStats.productivityDistribution.high, color: '#4CAF50' },
+            { label: 'Medium Productivity', value: commitStats.productivityDistribution.medium, color: '#FF9800' },
+            { label: 'Low Productivity', value: commitStats.productivityDistribution.low, color: '#757575' }
+        ];
+
+        // File type bar chart data
+        const fileTypeData = this._timeTracker.getTopFileTypes(8);
+        const fileTypeLabels = fileTypeData.map(ft => ft.extension);
+        const fileTypeValues = fileTypeData.map(ft => ft.totalTime / 3600);
+
+        // Commit timeline data (last 30 commits)
+        const recentCommits = commitHistory.slice(0, 30);
+        const commitTimelineLabels = recentCommits.map(c => c.date.toLocaleDateString());
+        const commitTimelineData = recentCommits.map(c => c.timeSpent / 3600);
+
+        // Hourly heatmap data (24 hours x 7 days)
+        const heatmapData = this.generateHourlyHeatmapData(dailyData);
 
         return `<!DOCTYPE html>
             <html lang="en">
@@ -388,21 +527,107 @@ export class DashboardPanel {
                 </div>
 
                 <div class="tabs">
-                    <button class="tab-link active" onclick="openTab(event, 'overview')">Overview</button>
-                    <button class="tab-link" onclick="openTab(event, 'projects')">Projects</button>
-                    <button class="tab-link" onclick="openTab(event, 'daily')">Daily Breakdown</button>
+                    <button class="tab-link${this._activeTab === 'overview' ? ' active' : ''}" onclick="openTab(event, 'overview')">Overview</button>
+                    <button class="tab-link${this._activeTab === 'commits' ? ' active' : ''}" onclick="openTab(event, 'commits')">Commits</button>
+                    <button class="tab-link${this._activeTab === 'projects' ? ' active' : ''}" onclick="openTab(event, 'projects')">Projects</button>
+                    <button class="tab-link${this._activeTab === 'daily' ? ' active' : ''}" onclick="openTab(event, 'daily')">Daily Breakdown</button>
                 </div>
 
-                <div id="overview" class="tab-content active">
+                <div id="overview" class="tab-content${this._activeTab === 'overview' ? ' active' : ''}" style="display: ${this._activeTab === 'overview' ? 'block' : 'none'}">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+                        <div class="card">
+                            <h2>Weekly Activity</h2>
+                            <div class="chart-container" style="height: 300px;">
+                                <canvas id="weekly-chart"></canvas>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <h2>Project Distribution</h2>
+                            <div class="chart-container" style="height: 300px;">
+                                <canvas id="project-pie-chart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+                        <div class="card">
+                            <h2>File Types</h2>
+                            <div class="chart-container" style="height: 300px;">
+                                <canvas id="filetype-bar-chart"></canvas>
+                            </div>
+                        </div>
+                        <div class="card">
+                            <h2>Commit Productivity</h2>
+                            <div class="chart-container" style="height: 300px;">
+                                <canvas id="productivity-pie-chart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div class="card">
-                        <h2>Last 7 Days Activity</h2>
-                        <div class="chart-container">
-                            <canvas id="weekly-chart"></canvas>
+                        <h2>Productivity Heatmap</h2>
+                        <div style="text-align: center;">
+                            <div id="heatmap-container" style="display: inline-block; margin: 1rem;"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="card">
+                        <h2>Commit Timeline</h2>
+                        <div class="chart-container" style="height: 300px;">
+                            <canvas id="commit-timeline-chart"></canvas>
                         </div>
                     </div>
                 </div>
 
-                <div id="projects" class="tab-content">
+                <div id="commits" class="tab-content${this._activeTab === 'commits' ? ' active' : ''}" style="display: ${this._activeTab === 'commits' ? 'block' : 'none'}">
+                    <div class="card">
+                        <h2>Commit Analytics</h2>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+                            <div style="text-align: center; padding: 1rem; background: var(--vscode-editor-background); border-radius: 8px;">
+                                <div style="font-size: 2em; font-weight: bold; color: var(--vscode-charts-blue);">${commitStats.totalCommits}</div>
+                                <div style="font-size: 0.9em; color: var(--vscode-descriptionForeground);">Total Commits</div>
+                            </div>
+                            <div style="text-align: center; padding: 1rem; background: var(--vscode-editor-background); border-radius: 8px;">
+                                <div style="font-size: 2em; font-weight: bold; color: var(--vscode-charts-green);">${this._formatTime(commitStats.totalTimeOnCommits)}</div>
+                                <div style="font-size: 0.9em; color: var(--vscode-descriptionForeground);">Total Time</div>
+                            </div>
+                            <div style="text-align: center; padding: 1rem; background: var(--vscode-editor-background); border-radius: 8px;">
+                                <div style="font-size: 2em; font-weight: bold; color: var(--vscode-charts-orange);">${this._formatTime(commitStats.averageTimePerCommit)}</div>
+                                <div style="font-size: 0.9em; color: var(--vscode-descriptionForeground);">Avg per Commit</div>
+                            </div>
+                            <div style="text-align: center; padding: 1rem; background: var(--vscode-editor-background); border-radius: 8px;">
+                                <div style="font-size: 1.2em; font-weight: bold;">
+                                    <span style="color: #4CAF50;">${commitStats.productivityDistribution.high}</span> / 
+                                    <span style="color: #FF9800;">${commitStats.productivityDistribution.medium}</span> / 
+                                    <span style="color: #757575;">${commitStats.productivityDistribution.low}</span>
+                                </div>
+                                <div style="font-size: 0.9em; color: var(--vscode-descriptionForeground);">High/Med/Low Productivity</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="card">
+                        <h2>Recent Commits</h2>
+                        <div style="overflow-x: auto;">
+                            <table style="width: 100%; min-width: 800px;">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 35%;">Message</th>
+                                        <th>Branch</th>
+                                        <th>Time Spent</th>
+                                        <th>Files</th>
+                                        <th>Changes</th>
+                                        <th>Productivity</th>
+                                        <th>Date</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${commitRows}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="projects" class="tab-content${this._activeTab === 'projects' ? ' active' : ''}" style="display: ${this._activeTab === 'projects' ? 'block' : 'none'}">
                     <div class="card">
                         <h2>All Projects</h2>
                         <table>
@@ -412,7 +637,7 @@ export class DashboardPanel {
                     </div>
                 </div>
 
-                <div id="daily" class="tab-content">
+                <div id="daily" class="tab-content${this._activeTab === 'daily' ? ' active' : ''}" style="display: ${this._activeTab === 'daily' ? 'block' : 'none'}">
                     <div class="card">
                         <h2>Recent Activity</h2>
                         <table>
@@ -435,6 +660,8 @@ export class DashboardPanel {
                 <script nonce="${nonce}">
                     const vscode = acquireVsCodeApi();
 
+                    let currentActiveTab = '${this._activeTab}';
+                    
                     function openTab(event, tabName) {
                         let i, tabcontent, tablinks;
                         tabcontent = document.getElementsByClassName("tab-content");
@@ -447,6 +674,40 @@ export class DashboardPanel {
                         }
                         document.getElementById(tabName).style.display = "block";
                         event.currentTarget.className += " active";
+                        
+                        // Notify extension about tab change
+                        currentActiveTab = tabName;
+                        vscode.postMessage({ command: 'tabChanged', tab: tabName });
+                    }
+                    
+                    // Handle messages from extension
+                    window.addEventListener('message', event => {
+                        const message = event.data;
+                        if (message.command === 'updateDynamicData') {
+                            updateDynamicContent(message.data);
+                        }
+                    });
+                    
+                    function updateDynamicContent(data) {
+                        // Update current status
+                        const statusElement = document.querySelector('.card h2');
+                        if (statusElement && statusElement.textContent === 'Current Status') {
+                            const statusCard = statusElement.parentElement;
+                            const statusText = data.isTracking ? \`Tracking (\${data.sessionTime})\` : 'Paused';
+                            const projectInfo = statusCard.querySelector('p:first-of-type');
+                            const statusInfo = statusCard.querySelector('p:nth-of-type(2)');
+                            
+                            if (projectInfo) projectInfo.innerHTML = \`<strong>Current Project:</strong> \${data.currentProject}\`;
+                            if (statusInfo) statusInfo.innerHTML = \`<strong>Status:</strong> \${statusText}\`;
+                        }
+                        
+                        // Preserve active tab
+                        if (data.activeTab && data.activeTab !== currentActiveTab) {
+                            const tabToActivate = document.querySelector(\`button[onclick*="\${data.activeTab}"]\`);
+                            if (tabToActivate) {
+                                tabToActivate.click();
+                            }
+                        }
                     }
 
                     document.getElementById('start-btn').addEventListener('click', () => vscode.postMessage({ command: 'startTracking' }));
@@ -457,6 +718,7 @@ export class DashboardPanel {
                     document.getElementById('import-btn').addEventListener('click', () => vscode.postMessage({ command: 'importData' }));
 
                     window.addEventListener('load', () => {
+                        // Weekly Activity Bar Chart
                         const weeklyCtx = document.getElementById('weekly-chart').getContext('2d');
                         if (weeklyCtx) {
                             new Chart(weeklyCtx, {
@@ -474,15 +736,175 @@ export class DashboardPanel {
                                 options: {
                                     responsive: true,
                                     maintainAspectRatio: false,
+                                    plugins: {
+                                        legend: { display: false }
+                                    },
                                     scales: {
                                         y: {
-                                            beginAtZero: true
+                                            beginAtZero: true,
+                                            title: { display: true, text: 'Hours' }
                                         }
                                     }
                                 }
                             });
                         }
+
+                        // Project Distribution Pie Chart
+                        const projectPieCtx = document.getElementById('project-pie-chart').getContext('2d');
+                        if (projectPieCtx) {
+                            new Chart(projectPieCtx, {
+                                type: 'pie',
+                                data: {
+                                    labels: ${JSON.stringify(projectTimeData.map(p => p.label))},
+                                    datasets: [{
+                                        data: ${JSON.stringify(projectTimeData.map(p => p.value))},
+                                        backgroundColor: ${JSON.stringify(projectTimeData.map(p => p.color))},
+                                        borderWidth: 2
+                                    }]
+                                },
+                                options: {
+                                    responsive: true,
+                                    maintainAspectRatio: false,
+                                    plugins: {
+                                        legend: { position: 'bottom' },
+                                        tooltip: {
+                                            callbacks: {
+                                                label: function(context) {
+                                                    return context.label + ': ' + context.parsed.toFixed(1) + 'h';
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        // File Types Bar Chart
+                        const fileTypeCtx = document.getElementById('filetype-bar-chart').getContext('2d');
+                        if (fileTypeCtx) {
+                            new Chart(fileTypeCtx, {
+                                type: 'bar',
+                                data: {
+                                    labels: ${JSON.stringify(fileTypeLabels)},
+                                    datasets: [{
+                                        label: 'Hours Spent',
+                                        data: ${JSON.stringify(fileTypeValues)},
+                                        backgroundColor: 'rgba(255, 159, 64, 0.6)',
+                                        borderColor: 'rgba(255, 159, 64, 1)',
+                                        borderWidth: 1
+                                    }]
+                                },
+                                options: {
+                                    responsive: true,
+                                    maintainAspectRatio: false,
+                                    plugins: {
+                                        legend: { display: false }
+                                    },
+                                    scales: {
+                                        y: {
+                                            beginAtZero: true,
+                                            title: { display: true, text: 'Hours' }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        // Productivity Pie Chart
+                        const productivityCtx = document.getElementById('productivity-pie-chart').getContext('2d');
+                        if (productivityCtx) {
+                            new Chart(productivityCtx, {
+                                type: 'doughnut',
+                                data: {
+                                    labels: ${JSON.stringify(productivityData.map(p => p.label))},
+                                    datasets: [{
+                                        data: ${JSON.stringify(productivityData.map(p => p.value))},
+                                        backgroundColor: ${JSON.stringify(productivityData.map(p => p.color))},
+                                        borderWidth: 2
+                                    }]
+                                },
+                                options: {
+                                    responsive: true,
+                                    maintainAspectRatio: false,
+                                    plugins: {
+                                        legend: { position: 'bottom' }
+                                    }
+                                }
+                            });
+                        }
+
+                        // Commit Timeline Line Chart
+                        const timelineCtx = document.getElementById('commit-timeline-chart').getContext('2d');
+                        if (timelineCtx) {
+                            new Chart(timelineCtx, {
+                                type: 'line',
+                                data: {
+                                    labels: ${JSON.stringify(commitTimelineLabels)},
+                                    datasets: [{
+                                        label: 'Time per Commit (hours)',
+                                        data: ${JSON.stringify(commitTimelineData)},
+                                        borderColor: 'rgba(75, 192, 192, 1)',
+                                        backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                                        fill: true,
+                                        tension: 0.4
+                                    }]
+                                },
+                                options: {
+                                    responsive: true,
+                                    maintainAspectRatio: false,
+                                    plugins: {
+                                        legend: { display: false }
+                                    },
+                                    scales: {
+                                        y: {
+                                            beginAtZero: true,
+                                            title: { display: true, text: 'Hours' }
+                                        },
+                                        x: {
+                                            title: { display: true, text: 'Commits (chronological)' }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        // Productivity Heatmap
+                        createHeatmap();
                     });
+
+                    function createHeatmap() {
+                        const heatmapData = ${JSON.stringify(heatmapData)};
+                        const container = document.getElementById('heatmap-container');
+                        if (!container) return;
+
+                        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+                        const cellSize = 20;
+                        const maxValue = Math.max(...heatmapData.flat());
+
+                        let html = '<div style="margin-bottom: 10px;"><strong>Productivity by Hour & Day</strong></div>';
+                        html += '<div style="display: grid; grid-template-columns: 40px repeat(7, 25px); gap: 2px; font-size: 12px;">';
+                        
+                        // Header row with day names
+                        html += '<div></div>';
+                        days.forEach(day => {
+                            html += \`<div style="text-align: center; font-weight: bold;">\${day}</div>\`;
+                        });
+
+                        // Hour rows
+                        for (let hour = 0; hour < 24; hour++) {
+                            html += \`<div style="text-align: right; padding-right: 5px; line-height: 25px;">\${hour.toString().padStart(2, '0')}</div>\`;
+                            for (let day = 0; day < 7; day++) {
+                                const value = heatmapData[hour][day];
+                                const opacity = maxValue > 0 ? (value / maxValue) : 0;
+                                const color = \`rgba(54, 162, 235, \${opacity})\`;
+                                const title = \`\${days[day]} \${hour}:00 - \${value.toFixed(1)}h\`;
+                                html += \`<div style="width: 25px; height: 25px; background-color: \${color}; border: 1px solid #ddd; cursor: pointer;" title="\${title}"></div>\`;
+                            }
+                        }
+                        
+                        html += '</div>';
+                        container.innerHTML = html;
+                    }
                 </script>
             </body>
             </html>`;

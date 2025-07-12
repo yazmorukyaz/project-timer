@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { GitIntegration, GitInfo } from './gitIntegration';
+import { GitIntegration, GitInfo, CommitTimeEntry, GitCommitListener } from './gitIntegration';
 import { FileTypeTracker } from './fileTypeTracker';
 
 // Data structure interfaces
@@ -92,6 +92,19 @@ export interface ProductivityInsight {
     importance: 'high' | 'medium' | 'low';
 }
 
+export interface CommitData {
+    commitHash: string;
+    message: string;
+    author: string;
+    date: Date;
+    branch: string;
+    timeSpent: number; // seconds of accumulated work before this commit
+    filesChanged: string[];
+    linesAdded: number;
+    linesDeleted: number;
+    productivity: 'high' | 'medium' | 'low';
+}
+
 export class TimeTracker {
     private context: vscode.ExtensionContext;
     private isTracking: boolean = false;
@@ -133,6 +146,12 @@ export class TimeTracker {
     private lastContextSwitch: number = 0;
     private sessionInterruptions: number = 0;
 
+    // Commit tracking
+    private commitData: { [projectName: string]: CommitData[] } = {};
+    private sessionStartTime: number = 0;
+    private currentSessionTime: number = 0;
+    private preCommitTime: number = 0; // Time accumulated before a commit
+
     // Integration modules
     private gitIntegration: GitIntegration;
     private fileTypeTracker: FileTypeTracker;
@@ -163,6 +182,17 @@ export class TimeTracker {
             this.currentFileType = fileType;
             this.onContextSwitch();
         });
+
+        // Set up Git commit listener
+        const commitListener: GitCommitListener = {
+            onCommitDetected: (commit: CommitTimeEntry) => {
+                this.handleCommitDetected(commit);
+            },
+            onBranchSwitch: (fromBranch: string, toBranch: string) => {
+                this.handleBranchSwitch(fromBranch, toBranch);
+            }
+        };
+        this.gitIntegration.addCommitListener(commitListener);
 
         this.saveDataInterval = setInterval(() => this.saveData(), 60000);
 
@@ -441,47 +471,90 @@ export class TimeTracker {
 
     // --- Activity Detection ---
     private setupActivityDetection(): void {
-        const onActivity = () => {
+        // Enhanced activity detection with intelligent filtering
+        const onHighPriorityActivity = (activityType: 'text-edit' | 'file-save' | 'file-open') => {
             if (this.activityDebounceTimeout) clearTimeout(this.activityDebounceTimeout);
-            this.activityDebounceTimeout = setTimeout(() => this.onActivity(), 1000);
+            this.activityDebounceTimeout = setTimeout(() => this.onActivity(activityType), 500); // Faster response for important activities
+        };
+
+        const onMediumPriorityActivity = (activityType: 'selection' | 'editor-switch' | 'window-focus') => {
+            if (this.activityDebounceTimeout) clearTimeout(this.activityDebounceTimeout);
+            this.activityDebounceTimeout = setTimeout(() => this.onActivity(activityType), 1000);
+        };
+
+        const onLowPriorityActivity = (activityType: 'theme-change' | 'layout-change') => {
+            if (this.activityDebounceTimeout) clearTimeout(this.activityDebounceTimeout);
+            this.activityDebounceTimeout = setTimeout(() => this.onActivity(activityType), 2000);
         };
 
         this.context.subscriptions.push(
-            // Document and editor events
-            vscode.workspace.onDidChangeTextDocument(onActivity),
-            vscode.window.onDidChangeActiveTextEditor(onActivity),
-            vscode.window.onDidChangeWindowState(onActivity),
-            vscode.window.onDidChangeTextEditorSelection(onActivity),
-            vscode.window.onDidChangeActiveColorTheme(onActivity),
-            vscode.window.onDidChangeTextEditorViewColumn(onActivity),
+            // High priority: Actual coding activities
+            vscode.workspace.onDidChangeTextDocument((e) => {
+                // Only trigger for actual content changes, not just cursor movements
+                if (e.contentChanges.length > 0) {
+                    onHighPriorityActivity('text-edit');
+                }
+            }),
+            vscode.workspace.onDidSaveTextDocument(() => onHighPriorityActivity('file-save')),
+            vscode.workspace.onDidOpenTextDocument(() => onHighPriorityActivity('file-open')),
             
-            // Workspace events
-            vscode.workspace.onDidOpenTextDocument(onActivity),
-            vscode.workspace.onDidCloseTextDocument(onActivity),
-            vscode.workspace.onDidSaveTextDocument(onActivity),
-            vscode.workspace.onDidChangeWorkspaceFolders(onActivity),
+            // Medium priority: Navigation and focus activities
+            vscode.window.onDidChangeActiveTextEditor(() => onMediumPriorityActivity('editor-switch')),
+            vscode.window.onDidChangeWindowState((state) => {
+                // Only trigger on focus gain, not focus loss
+                if (state.focused) {
+                    onMediumPriorityActivity('window-focus');
+                }
+            }),
+            vscode.window.onDidChangeTextEditorSelection(() => onMediumPriorityActivity('selection')),
             
-            // Terminal events
-            vscode.window.onDidOpenTerminal(onActivity),
-            vscode.window.onDidCloseTerminal(onActivity)
+            // Git events (medium priority)
+            vscode.workspace.onDidChangeWorkspaceFolders(() => onMediumPriorityActivity('editor-switch')),
+            
+            // Low priority: UI changes
+            vscode.window.onDidChangeActiveColorTheme(() => onLowPriorityActivity('theme-change')),
+            vscode.window.onDidChangeTextEditorViewColumn(() => onLowPriorityActivity('layout-change')),
+            
+            // Terminal activities (medium priority)
+            vscode.window.onDidOpenTerminal(() => onMediumPriorityActivity('editor-switch')),
+            vscode.window.onDidCloseTerminal(() => onMediumPriorityActivity('editor-switch')),
+
+            // Debug session activities
+            vscode.debug.onDidStartDebugSession(() => onMediumPriorityActivity('editor-switch')),
+            vscode.debug.onDidTerminateDebugSession(() => onMediumPriorityActivity('editor-switch')),
+            
+            // Task execution
+            vscode.tasks.onDidStartTask(() => onMediumPriorityActivity('editor-switch')),
+            vscode.tasks.onDidEndTask(() => onMediumPriorityActivity('editor-switch'))
         );
     }
 
-    private onActivity(): void {
+    private onActivity(activityType?: string): void {
         this.lastActivityTime = Date.now();
 
-        // Auto-resume with delay if not currently tracking
+        // Enhanced auto-resume logic based on activity type
         if (!this.isTracking && this.autoResume) {
-            // Add a small delay before auto-resuming to avoid false triggers
-            setTimeout(() => {
-                if (!this.isTracking && this.autoResume) {
-                    this.resumeTracking();
-                    vscode.window.showInformationMessage(
-                        `Activity detected - auto-resuming timer for ${this.currentProject}`,
-                        { modal: false }
-                    );
-                }
-            }, this.autoResumeDelay * 1000);
+            const highPriorityActivities = ['text-edit', 'file-save', 'file-open'];
+            const shouldAutoResume = highPriorityActivities.includes(activityType || '') || 
+                                   !activityType; // Legacy support
+            
+            if (shouldAutoResume) {
+                // Immediate resume for high-priority activities, delayed for others
+                const delay = highPriorityActivities.includes(activityType || '') ? 500 : this.autoResumeDelay * 1000;
+                
+                setTimeout(() => {
+                    if (!this.isTracking && this.autoResume) {
+                        this.resumeTracking();
+                        const activityLabel = activityType ? 
+                            this.getActivityLabel(activityType) : 'Activity';
+                        
+                        vscode.window.showInformationMessage(
+                            `${activityLabel} detected - auto-resuming timer for ${this.currentProject}`,
+                            { modal: false }
+                        );
+                    }
+                }, delay);
+            }
         }
 
         // Reset inactivity timer
@@ -496,6 +569,20 @@ export class TimeTracker {
                 this.stopTracking();
             }
         }, this.inactivityThreshold * 60 * 1000);
+    }
+
+    private getActivityLabel(activityType: string): string {
+        const labels: { [key: string]: string } = {
+            'text-edit': 'Code editing',
+            'file-save': 'File save',
+            'file-open': 'File opened',
+            'editor-switch': 'Editor navigation',
+            'window-focus': 'Window focus',
+            'selection': 'Text selection',
+            'theme-change': 'Theme change',
+            'layout-change': 'Layout change'
+        };
+        return labels[activityType] || 'Activity';
     }
 
     // --- Pomodoro --- 
@@ -543,7 +630,11 @@ export class TimeTracker {
     // --- Data Persistence ---
     private saveData(): void {
         try {
-            const data = { projectData: this.projectData, dailyData: this.dailyData };
+            const data = { 
+                projectData: this.projectData, 
+                dailyData: this.dailyData,
+                commitData: this.commitData
+            };
             fs.writeFileSync(this.dataFilePath, JSON.stringify(data, null, 2));
         } catch (error) {
             console.error('Error saving project timer data:', error);
@@ -557,11 +648,13 @@ export class TimeTracker {
                 const data = JSON.parse(rawData);
                 this.projectData = data.projectData || {};
                 this.dailyData = data.dailyData || {};
+                this.commitData = data.commitData || {};
             }
         } catch (error) {
             console.error('Error loading project timer data:', error);
             this.projectData = {};
             this.dailyData = {};
+            this.commitData = {};
         }
     }
 
@@ -638,6 +731,135 @@ export class TimeTracker {
     private getDateString = (date: Date) => `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
     public registerDataChangeListener = (callback: () => void) => this.onDataChangedCallbacks.push(callback);
     private notifyDataChanged = () => this.onDataChangedCallbacks.forEach(cb => cb());
+
+    private _formatTime(seconds: number): string {
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const secs = Math.floor(seconds % 60);
+        
+        if (hours > 0) {
+            return `${hours}h ${minutes}m ${secs}s`;
+        } else if (minutes > 0) {
+            return `${minutes}m ${secs}s`;
+        } else {
+            return `${secs}s`;
+        }
+    }
+
+    // --- Commit Handling ---
+    private handleCommitDetected(commit: CommitTimeEntry): void {
+        if (!this.currentProject || this.currentProject === 'No Project') {
+            return;
+        }
+
+        // Calculate time spent on this commit (current session time)
+        const timeSpent = this.getCurrentSessionTime();
+        
+        // Determine productivity level based on time spent and changes
+        const productivity = this.calculateCommitProductivity(timeSpent, commit.linesAdded, commit.linesDeleted);
+
+        const commitData: CommitData = {
+            commitHash: commit.hash,
+            message: commit.message,
+            author: commit.author,
+            date: commit.date,
+            branch: commit.branch,
+            timeSpent: timeSpent,
+            filesChanged: commit.filesChanged,
+            linesAdded: commit.linesAdded,
+            linesDeleted: commit.linesDeleted,
+            productivity: productivity
+        };
+
+        // Store commit data
+        if (!this.commitData[this.currentProject]) {
+            this.commitData[this.currentProject] = [];
+        }
+        this.commitData[this.currentProject].push(commitData);
+
+        // Reset session time (commit marks end of work session for that commit)
+        this.sessionStartTime = Date.now();
+        
+        this.saveData();
+        this.notifyDataChanged();
+
+        // Show notification about commit tracking
+        vscode.window.showInformationMessage(
+            `Commit tracked: ${this._formatTime(timeSpent)} on "${commit.message.substring(0, 50)}..."`
+        );
+    }
+
+    private handleBranchSwitch(fromBranch: string, toBranch: string): void {
+        this.currentGitBranch = toBranch;
+        
+        // Auto-resume tracking when switching branches (indicates work resumption)
+        if (this.autoResume && !this.isTracking) {
+            setTimeout(() => {
+                this.startTracking();
+                vscode.window.showInformationMessage(`Auto-resumed tracking on branch: ${toBranch}`);
+            }, this.autoResumeDelay * 1000);
+        }
+
+        this.onContextSwitch();
+    }
+
+    private calculateCommitProductivity(timeSpent: number, linesAdded: number, linesDeleted: number): 'high' | 'medium' | 'low' {
+        const totalChanges = linesAdded + linesDeleted;
+        const changesPerMinute = totalChanges / (timeSpent / 60);
+
+        if (changesPerMinute > 10 && timeSpent > 300) { // 5+ minutes with good velocity
+            return 'high';
+        } else if (changesPerMinute > 5 || timeSpent > 600) { // 10+ minutes or decent velocity
+            return 'medium';
+        } else {
+            return 'low';
+        }
+    }
+
+    public getCommitHistory(projectName?: string): CommitData[] {
+        if (projectName) {
+            return this.commitData[projectName] || [];
+        }
+        
+        // Return all commits from all projects
+        const allCommits: CommitData[] = [];
+        Object.values(this.commitData).forEach(commits => {
+            allCommits.push(...commits);
+        });
+        
+        return allCommits.sort((a, b) => b.date.getTime() - a.date.getTime());
+    }
+
+    public getCommitStats(): {
+        totalCommits: number;
+        totalTimeOnCommits: number;
+        averageTimePerCommit: number;
+        productivityDistribution: { high: number; medium: number; low: number };
+        topCommitsByTime: CommitData[];
+    } {
+        const allCommits = this.getCommitHistory();
+        const totalCommits = allCommits.length;
+        const totalTimeOnCommits = allCommits.reduce((sum, commit) => sum + commit.timeSpent, 0);
+        const averageTimePerCommit = totalCommits > 0 ? totalTimeOnCommits / totalCommits : 0;
+
+        const productivityDistribution = {
+            high: allCommits.filter(c => c.productivity === 'high').length,
+            medium: allCommits.filter(c => c.productivity === 'medium').length,
+            low: allCommits.filter(c => c.productivity === 'low').length
+        };
+
+        const topCommitsByTime = allCommits
+            .sort((a, b) => b.timeSpent - a.timeSpent)
+            .slice(0, 10);
+
+        return {
+            totalCommits,
+            totalTimeOnCommits,
+            averageTimePerCommit,
+            productivityDistribution,
+            topCommitsByTime
+        };
+    }
 
     // --- Data Import/Export ---
     public importData(projectData: { [projectName: string]: ProjectTime }, dailyData: { [date: string]: DailyRecord }): void {

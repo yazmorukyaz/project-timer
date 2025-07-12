@@ -17,10 +17,31 @@ export interface GitInfo {
     };
 }
 
+export interface CommitTimeEntry {
+    hash: string;
+    message: string;
+    author: string;
+    date: Date;
+    branch: string;
+    timeSpent: number; // seconds
+    filesChanged: string[];
+    linesAdded: number;
+    linesDeleted: number;
+}
+
+export interface GitCommitListener {
+    onCommitDetected: (commit: CommitTimeEntry) => void;
+    onBranchSwitch: (fromBranch: string, toBranch: string) => void;
+}
+
 export class GitIntegration {
     private git: SimpleGit | null = null;
     private workspacePath: string = '';
     private currentGitInfo: GitInfo | null = null;
+    private commitListeners: GitCommitListener[] = [];
+    private lastCommitHash: string = '';
+    private currentBranch: string = '';
+    private gitWatcher: vscode.FileSystemWatcher | null = null;
 
     constructor() {
         this.updateWorkspace();
@@ -36,9 +57,43 @@ export class GitIntegration {
         if (workspaceFolders && workspaceFolders.length > 0) {
             this.workspacePath = workspaceFolders[0].uri.fsPath;
             this.git = simpleGit(this.workspacePath);
+            this.setupGitWatcher();
         } else {
             this.git = null;
             this.workspacePath = '';
+            this.disposeGitWatcher();
+        }
+    }
+
+    private setupGitWatcher(): void {
+        this.disposeGitWatcher();
+        
+        if (this.workspacePath) {
+            // Watch for changes in the .git directory
+            const gitPattern = path.join(this.workspacePath, '.git', '**');
+            this.gitWatcher = vscode.workspace.createFileSystemWatcher(gitPattern);
+            
+            // Watch for commit changes (HEAD file changes)
+            this.gitWatcher.onDidChange((uri) => {
+                const fileName = path.basename(uri.fsPath);
+                if (fileName === 'HEAD' || fileName === 'index') {
+                    this.checkForNewCommits();
+                }
+            });
+            
+            this.gitWatcher.onDidCreate((uri) => {
+                const fileName = path.basename(uri.fsPath);
+                if (fileName === 'HEAD' || fileName === 'index') {
+                    this.checkForNewCommits();
+                }
+            });
+        }
+    }
+
+    private disposeGitWatcher(): void {
+        if (this.gitWatcher) {
+            this.gitWatcher.dispose();
+            this.gitWatcher = null;
         }
     }
 
@@ -200,5 +255,147 @@ export class GitIntegration {
 
     public async refreshGitInfo(): Promise<void> {
         await this.getCurrentGitInfo();
+    }
+
+    public addCommitListener(listener: GitCommitListener): void {
+        this.commitListeners.push(listener);
+    }
+
+    public removeCommitListener(listener: GitCommitListener): void {
+        const index = this.commitListeners.indexOf(listener);
+        if (index > -1) {
+            this.commitListeners.splice(index, 1);
+        }
+    }
+
+    private async checkForNewCommits(): Promise<void> {
+        if (!this.git) return;
+
+        try {
+            // Get current branch
+            const currentBranch = await this.git.revparse(['--abbrev-ref', 'HEAD']);
+            const trimmedBranch = currentBranch.trim();
+
+            // Check for branch switch
+            if (this.currentBranch && this.currentBranch !== trimmedBranch) {
+                this.notifyBranchSwitch(this.currentBranch, trimmedBranch);
+            }
+            this.currentBranch = trimmedBranch;
+
+            // Get latest commit
+            const log = await this.git.log({ maxCount: 1 });
+            if (log.latest && log.latest.hash !== this.lastCommitHash) {
+                this.lastCommitHash = log.latest.hash;
+                
+                // Get commit details with stats
+                const commitDetails = await this.getCommitDetails(log.latest.hash);
+                if (commitDetails) {
+                    this.notifyCommitDetected(commitDetails);
+                }
+            }
+        } catch (error) {
+            console.error('Error checking for new commits:', error);
+        }
+    }
+
+    private async getCommitDetails(commitHash: string): Promise<CommitTimeEntry | null> {
+        if (!this.git) return null;
+
+        try {
+            // Get commit info
+            const log = await this.git.log({ from: commitHash, to: commitHash, maxCount: 1 });
+            const commit = log.latest;
+            if (!commit) return null;
+
+            // Get commit stats
+            const diffSummary = await this.git.diffSummary([`${commitHash}^`, commitHash]);
+            const filesChanged = diffSummary.files.map(file => file.file);
+
+            return {
+                hash: commit.hash,
+                message: commit.message,
+                author: commit.author_name,
+                date: new Date(commit.date),
+                branch: this.currentBranch,
+                timeSpent: 0, // Will be set by time tracker
+                filesChanged,
+                linesAdded: diffSummary.insertions,
+                linesDeleted: diffSummary.deletions
+            };
+        } catch (error) {
+            console.error('Error getting commit details:', error);
+            return null;
+        }
+    }
+
+    private notifyCommitDetected(commit: CommitTimeEntry): void {
+        this.commitListeners.forEach(listener => {
+            try {
+                listener.onCommitDetected(commit);
+            } catch (error) {
+                console.error('Error notifying commit listener:', error);
+            }
+        });
+    }
+
+    private notifyBranchSwitch(fromBranch: string, toBranch: string): void {
+        this.commitListeners.forEach(listener => {
+            try {
+                listener.onBranchSwitch(fromBranch, toBranch);
+            } catch (error) {
+                console.error('Error notifying branch switch listener:', error);
+            }
+        });
+    }
+
+    public async getCommitHistory(count: number = 50): Promise<CommitTimeEntry[]> {
+        if (!this.git) return [];
+
+        try {
+            const log = await this.git.log({ maxCount: count });
+            const commits: CommitTimeEntry[] = [];
+
+            for (const commit of log.all) {
+                try {
+                    const diffSummary = await this.git.diffSummary([`${commit.hash}^`, commit.hash]);
+                    const filesChanged = diffSummary.files.map(file => file.file);
+
+                    commits.push({
+                        hash: commit.hash,
+                        message: commit.message,
+                        author: commit.author_name,
+                        date: new Date(commit.date),
+                        branch: this.currentBranch, // Note: this might not be accurate for old commits
+                        timeSpent: 0, // Will be populated from time tracking data
+                        filesChanged,
+                        linesAdded: diffSummary.insertions,
+                        linesDeleted: diffSummary.deletions
+                    });
+                } catch {
+                    // Skip commits where we can't get diff info (e.g., first commit)
+                    commits.push({
+                        hash: commit.hash,
+                        message: commit.message,
+                        author: commit.author_name,
+                        date: new Date(commit.date),
+                        branch: this.currentBranch,
+                        timeSpent: 0,
+                        filesChanged: [],
+                        linesAdded: 0,
+                        linesDeleted: 0
+                    });
+                }
+            }
+
+            return commits;
+        } catch (error) {
+            console.error('Error getting commit history:', error);
+            return [];
+        }
+    }
+
+    public dispose(): void {
+        this.disposeGitWatcher();
+        this.commitListeners = [];
     }
 }
