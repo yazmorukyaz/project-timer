@@ -6,12 +6,22 @@ import { StatusBarManager } from './statusBarManager';
 
 let timeTracker: TimeTracker;
 let statusBarManager: StatusBarManager;
+let isTrackingContext: vscode.EventEmitter<boolean>;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('Activating Project Timer extension');
     
+    // Set up context keys for keyboard shortcuts
+    vscode.commands.executeCommand('setContext', 'projectTimer.isTracking', false);
+    
     // Initialize the time tracker
     timeTracker = new TimeTracker(context);
+    
+    // Set up tracking state context
+    const updateTrackingContext = () => {
+        vscode.commands.executeCommand('setContext', 'projectTimer.isTracking', timeTracker.isCurrentlyTracking());
+    };
+    timeTracker.registerDataChangeListener(updateTrackingContext);
     
     // Create status bar item
     statusBarManager = new StatusBarManager(timeTracker);
@@ -30,13 +40,15 @@ export function activate(context: vscode.ExtensionContext) {
             DashboardPanel.createOrShow(context.extensionUri, timeTracker);
         }),
         
-        vscode.commands.registerCommand('project-timer.startTracking', () => {
-            timeTracker.startTracking();
+        vscode.commands.registerCommand('project-timer.startTracking', async () => {
+            await timeTracker.startTracking();
+            updateTrackingContext();
             vscode.window.showInformationMessage('Project Timer: Started tracking');
         }),
         
         vscode.commands.registerCommand('project-timer.stopTracking', () => {
             timeTracker.stopTracking();
+            updateTrackingContext();
             vscode.window.showInformationMessage('Project Timer: Stopped tracking');
         }),
         
@@ -97,7 +109,9 @@ export function activate(context: vscode.ExtensionContext) {
     );
     
     // Start tracking when the extension activates
-    timeTracker.startTracking();
+    timeTracker.startTracking().then(() => {
+        updateTrackingContext();
+    });
 }
 
 export function deactivate() {

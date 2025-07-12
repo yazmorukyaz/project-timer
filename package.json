@@ -44,6 +44,44 @@
       {
         "command": "project-timer.showGoalProgress",
         "title": "Project Timer: Show Goal Progress"
+      },
+      {
+        "command": "project-timer.switchProject",
+        "title": "Project Timer: Switch Project"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "project-timer.startTracking",
+        "key": "ctrl+shift+t s",
+        "mac": "cmd+shift+t s",
+        "when": "!projectTimer.isTracking"
+      },
+      {
+        "command": "project-timer.stopTracking", 
+        "key": "ctrl+shift+t x",
+        "mac": "cmd+shift+t x",
+        "when": "projectTimer.isTracking"
+      },
+      {
+        "command": "project-timer.showDashboard",
+        "key": "ctrl+shift+t d",
+        "mac": "cmd+shift+t d"
+      },
+      {
+        "command": "project-timer.showGoalProgress",
+        "key": "ctrl+shift+t g",
+        "mac": "cmd+shift+t g"
+      },
+      {
+        "command": "project-timer.switchProject",
+        "key": "ctrl+shift+t p",
+        "mac": "cmd+shift+t p"
+      },
+      {
+        "command": "project-timer.togglePomodoro",
+        "key": "ctrl+shift+t m",
+        "mac": "cmd+shift+t m"
       }
     ],
     "viewsContainers": {
@@ -105,6 +143,32 @@
           "type": "number",
           "default": 25,
           "description": "Weekly goal for hours spent on the current project"
+        },
+        "projectTimer.statusBarFormat": {
+          "type": "string",
+          "enum": ["session", "daily", "goal", "custom"],
+          "default": "session",
+          "description": "What to show in the status bar: current session, daily total, goal progress, or custom"
+        },
+        "projectTimer.trackFileTypes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Track time spent on different file types"
+        },
+        "projectTimer.trackGitInfo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Track Git branch and commit information"
+        },
+        "projectTimer.enableProductivityInsights": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show productivity insights and suggestions"
+        },
+        "projectTimer.focusThreshold": {
+          "type": "number",
+          "default": 15,
+          "description": "Minimum minutes of uninterrupted work to count as focus time"
         }
       }
     }
@@ -121,20 +185,22 @@
     "vsix": "vsce package"
   },
   "devDependencies": {
-    "@types/vscode": "^1.81.0",
     "@types/mocha": "^10.0.1",
     "@types/node": "20.x",
-    "eslint": "^8.47.0",
-    "typescript": "^5.1.6",
+    "@types/vscode": "^1.81.0",
     "@typescript-eslint/eslint-plugin": "^6.4.1",
     "@typescript-eslint/parser": "^6.4.1",
+    "eslint": "^8.47.0",
     "glob": "^10.3.3",
     "mocha": "^10.2.0",
     "ts-loader": "^9.4.4",
+    "typescript": "^5.1.6",
     "webpack": "^5.88.2",
     "webpack-cli": "^5.1.4"
   },
   "dependencies": {
-    "chart.js": "^4.4.0"
+    "chart.js": "^4.4.0",
+    "date-fns": "^4.1.0",
+    "simple-git": "^3.28.0"
   }
 }

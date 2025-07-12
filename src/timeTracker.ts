@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { GitIntegration, GitInfo } from './gitIntegration';
+import { FileTypeTracker } from './fileTypeTracker';
 
 // Data structure interfaces
 export interface TimeEntry {
@@ -8,6 +10,11 @@ export interface TimeEntry {
     startTime: number;
     endTime: number;
     duration: number; // in seconds
+    gitBranch?: string;
+    commitHash?: string;
+    fileTypes?: { [extension: string]: number }; // time spent per file type
+    focusTime?: number; // uninterrupted work time
+    context?: string; // additional context info
 }
 
 export interface ProjectTime {
@@ -16,18 +23,73 @@ export interface ProjectTime {
     totalTime: number; // in seconds
     entries: TimeEntry[];
     lastActive?: number;
+    gitInfo?: {
+        currentBranch: string;
+        repository: string;
+        remoteUrl?: string;
+    };
+    fileTypeStats: { [extension: string]: number }; // total time per file type
+    branchStats: { [branch: string]: number }; // total time per branch
+    productivity: {
+        averageFocusTime: number;
+        longestSession: number;
+        totalSessions: number;
+        interruptionCount: number;
+    };
 }
 
 export interface DailyRecord {
     date: string;
     projects: { [projectName: string]: number }; // time in seconds
     totalTime: number; // in seconds
+    fileTypes: { [extension: string]: number }; // time per file type
+    branches: { [branch: string]: number }; // time per branch
+    focusTime: number; // total uninterrupted time
+    sessionCount: number; // number of work sessions
+    mostProductiveHour: number; // 0-23
+    productivity: {
+        averageSessionLength: number;
+        longestFocusSession: number;
+        contextSwitches: number;
+    };
 }
 
 export interface ProjectStatistics {
     averageDailyTime: number;
     peakDay: { date: string; time: number };
     trend: number[]; // Last 7 days trend
+    fileTypeDistribution: { [extension: string]: number };
+    branchDistribution: { [branch: string]: number };
+    productivityPattern: {
+        mostProductiveHours: number[];
+        averageFocusTime: number;
+        weeklyPattern: number[]; // 0=Sunday, 6=Saturday
+    };
+    codeVelocity: {
+        linesPerHour?: number;
+        commitsPerSession?: number;
+        filesModifiedPerSession?: number;
+    };
+}
+
+// New interfaces for enhanced features
+export interface WorkSession {
+    startTime: number;
+    endTime: number;
+    duration: number;
+    focusTime: number;
+    interruptions: number;
+    filesWorkedOn: string[];
+    gitBranch: string;
+    productivity: 'high' | 'medium' | 'low';
+}
+
+export interface ProductivityInsight {
+    type: 'pattern' | 'suggestion' | 'achievement';
+    title: string;
+    description: string;
+    data?: any;
+    importance: 'high' | 'medium' | 'low';
 }
 
 export class TimeTracker {
@@ -58,9 +120,25 @@ export class TimeTracker {
     private breakDuration!: number;
     private dailyGoalHours!: number;
     private weeklyGoalHours!: number;
+    private statusBarFormat!: string;
+    private trackFileTypes!: boolean;
+    private trackGitInfo!: boolean;
     private inBreak: boolean = false;
 
+    // Enhanced tracking
+    private currentSession: WorkSession | null = null;
+    private currentFileType: string = '';
+    private currentGitBranch: string = '';
+    private focusStartTime: number = 0;
+    private lastContextSwitch: number = 0;
+    private sessionInterruptions: number = 0;
+
+    // Integration modules
+    private gitIntegration: GitIntegration;
+    private fileTypeTracker: FileTypeTracker;
+
     private onDataChangedCallbacks: Array<() => void> = [];
+    private onProductivityInsightCallbacks: Array<(insight: ProductivityInsight) => void> = [];
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
@@ -75,6 +153,16 @@ export class TimeTracker {
         this.loadConfig();
         this.loadData();
         this.setupActivityDetection();
+
+        // Initialize integration modules
+        this.gitIntegration = new GitIntegration();
+        this.fileTypeTracker = new FileTypeTracker();
+
+        // Set up file type change listener
+        this.fileTypeTracker.onFileTypeChange((fileType) => {
+            this.currentFileType = fileType;
+            this.onContextSwitch();
+        });
 
         this.saveDataInterval = setInterval(() => this.saveData(), 60000);
 
@@ -96,9 +184,12 @@ export class TimeTracker {
         this.breakDuration = config.get('breakDuration', 5);
         this.dailyGoalHours = config.get('dailyGoalHours', 0);
         this.weeklyGoalHours = config.get('weeklyGoalHours', 0);
+        this.statusBarFormat = config.get('statusBarFormat', 'session');
+        this.trackFileTypes = config.get('trackFileTypes', true);
+        this.trackGitInfo = config.get('trackGitInfo', true);
     }
 
-    public startTracking(): void {
+    public async startTracking(): Promise<void> {
         if (this.isTracking) return;
 
         this.updateCurrentProject();
@@ -110,6 +201,34 @@ export class TimeTracker {
         this.isTracking = true;
         this.startTime = Date.now();
         this.lastActivityTime = this.startTime;
+        this.focusStartTime = this.startTime;
+        this.sessionInterruptions = 0;
+
+        // Get current Git info if tracking is enabled
+        if (this.trackGitInfo) {
+            const gitInfo = await this.gitIntegration.getCurrentGitInfo();
+            if (gitInfo) {
+                this.currentGitBranch = gitInfo.branch;
+            }
+        }
+
+        // Start file type tracking
+        if (this.trackFileTypes) {
+            this.fileTypeTracker.startNewSession();
+            this.currentFileType = this.fileTypeTracker.getCurrentFileType();
+        }
+
+        // Start new work session
+        this.currentSession = {
+            startTime: this.startTime,
+            endTime: 0,
+            duration: 0,
+            focusTime: 0,
+            interruptions: 0,
+            filesWorkedOn: [],
+            gitBranch: this.currentGitBranch,
+            productivity: 'medium'
+        };
 
         if (this.enablePomodoro && !this.pomodoroTimeout) {
             this.startPomodoroCycle();
@@ -125,11 +244,28 @@ export class TimeTracker {
         const duration = (endTime - this.startTime) / 1000; // seconds
 
         if (this.currentProject && this.startTime > 0 && duration > 1) {
-            this.addTimeEntry(this.currentProject, this.startTime, endTime, duration);
+            // Calculate focus time
+            const focusTime = this.calculateFocusTime();
+            
+            // Get file type statistics for this session
+            const fileTypeStats = this.trackFileTypes ? this.fileTypeTracker.endCurrentFileTypeSession() : {};
+
+            // Complete current session
+            if (this.currentSession) {
+                this.currentSession.endTime = endTime;
+                this.currentSession.duration = duration;
+                this.currentSession.focusTime = focusTime;
+                this.currentSession.interruptions = this.sessionInterruptions;
+                this.currentSession.productivity = this.calculateProductivity(duration, focusTime, this.sessionInterruptions);
+            }
+
+            this.addTimeEntry(this.currentProject, this.startTime, endTime, duration, fileTypeStats);
         }
 
         this.isTracking = false;
         this.startTime = 0;
+        this.focusStartTime = 0;
+        this.currentSession = null;
         this.stopPomodoroCycle();
         this.notifyDataChanged();
     }
@@ -167,7 +303,7 @@ export class TimeTracker {
         this.notifyDataChanged();
     }
 
-    private addTimeEntry(projectName: string, startTime: number, endTime: number, duration: number): void {
+    private addTimeEntry(projectName: string, startTime: number, endTime: number, duration: number, fileTypeStats: { [extension: string]: number } = {}): void {
         if (!this.projectData[projectName]) {
             // Ensure we have a path before creating the project entry
             if (!this.currentProjectPath) {
@@ -179,18 +315,54 @@ export class TimeTracker {
                 projectPath: this.currentProjectPath,
                 totalTime: 0,
                 entries: [],
-                lastActive: Date.now()
+                lastActive: Date.now(),
+                fileTypeStats: {},
+                branchStats: {},
+                productivity: {
+                    averageFocusTime: 0,
+                    longestSession: 0,
+                    totalSessions: 0,
+                    interruptionCount: 0
+                }
             };
         }
 
-        const entry: TimeEntry = { projectName, startTime, endTime, duration };
+        const focusTime = this.calculateFocusTime();
+        const entry: TimeEntry = { 
+            projectName, 
+            startTime, 
+            endTime, 
+            duration,
+            gitBranch: this.currentGitBranch,
+            fileTypes: fileTypeStats,
+            focusTime,
+            context: this.getCurrentContext()
+        };
+        
         this.projectData[projectName].entries.push(entry);
         this.projectData[projectName].totalTime += duration;
         this.projectData[projectName].lastActive = Date.now();
 
+        // Update project-level statistics
+        this.updateProjectStats(projectName, duration, focusTime, fileTypeStats);
+
         const dateString = this.getDateString(new Date(startTime));
         if (!this.dailyData[dateString]) {
-            this.dailyData[dateString] = { date: dateString, projects: {}, totalTime: 0 };
+            this.dailyData[dateString] = { 
+                date: dateString, 
+                projects: {}, 
+                totalTime: 0,
+                fileTypes: {},
+                branches: {},
+                focusTime: 0,
+                sessionCount: 0,
+                mostProductiveHour: new Date(startTime).getHours(),
+                productivity: {
+                    averageSessionLength: 0,
+                    longestFocusSession: 0,
+                    contextSwitches: 0
+                }
+            };
         }
 
         if (!this.dailyData[dateString].projects[projectName]) {
@@ -199,6 +371,23 @@ export class TimeTracker {
 
         this.dailyData[dateString].projects[projectName] += duration;
         this.dailyData[dateString].totalTime += duration;
+        this.dailyData[dateString].focusTime += focusTime;
+        this.dailyData[dateString].sessionCount++;
+
+        // Update file type stats for the day
+        Object.entries(fileTypeStats).forEach(([extension, time]) => {
+            this.dailyData[dateString].fileTypes[extension] = (this.dailyData[dateString].fileTypes[extension] || 0) + time;
+        });
+
+        // Update branch stats for the day
+        if (this.currentGitBranch) {
+            this.dailyData[dateString].branches[this.currentGitBranch] = (this.dailyData[dateString].branches[this.currentGitBranch] || 0) + duration;
+        }
+
+        // Update productivity stats
+        this.dailyData[dateString].productivity.averageSessionLength = this.dailyData[dateString].totalTime / this.dailyData[dateString].sessionCount;
+        this.dailyData[dateString].productivity.longestFocusSession = Math.max(this.dailyData[dateString].productivity.longestFocusSession, focusTime);
+        this.dailyData[dateString].productivity.contextSwitches += this.sessionInterruptions;
 
         this.saveData();
     }
@@ -210,6 +399,17 @@ export class TimeTracker {
     public isCurrentlyTracking = () => this.isTracking;
     public getCurrentSessionTime = () => (this.isTracking && this.startTime > 0) ? (Date.now() - this.startTime) / 1000 : 0;
     public getTodayTotalTime = () => this.dailyData[this.getTodayString()]?.totalTime || 0;
+    
+    // Enhanced accessors
+    public getCurrentGitBranch = () => this.currentGitBranch;
+    public getCurrentFileType = () => this.currentFileType;
+    public getCurrentFocusTime = () => this.calculateFocusTime();
+    public getSessionInterruptions = () => this.sessionInterruptions;
+    public getCurrentSession = () => this.currentSession ? { ...this.currentSession } : null;
+    
+    public getFileTypeStats = () => this.fileTypeTracker ? this.fileTypeTracker.getFileTypeStats() : {};
+    public getTopFileTypes = (limit: number = 5) => this.fileTypeTracker ? this.fileTypeTracker.getTopFileTypes(limit) : [];
+    public getGitInfo = () => this.gitIntegration ? this.gitIntegration.getCurrentGitInfo() : null;
 
     public getGoalProgress() {
         const now = new Date();
@@ -365,6 +565,63 @@ export class TimeTracker {
         }
     }
 
+    // --- Enhanced Helper Methods ---
+    private calculateFocusTime(): number {
+        if (this.focusStartTime === 0) return 0;
+        return (Date.now() - this.focusStartTime) / 1000;
+    }
+
+    private calculateProductivity(duration: number, focusTime: number, interruptions: number): 'high' | 'medium' | 'low' {
+        const focusRatio = focusTime / duration;
+        const interruptionRate = interruptions / (duration / 3600); // interruptions per hour
+        
+        if (focusRatio > 0.8 && interruptionRate < 2) {
+            return 'high';
+        } else if (focusRatio > 0.5 && interruptionRate < 5) {
+            return 'medium';
+        } else {
+            return 'low';
+        }
+    }
+
+    private getCurrentContext(): string {
+        const gitBranch = this.currentGitBranch ? `branch:${this.currentGitBranch}` : '';
+        const fileType = this.currentFileType ? `file:${this.currentFileType}` : '';
+        return [gitBranch, fileType].filter(Boolean).join(',');
+    }
+
+    private onContextSwitch(): void {
+        const now = Date.now();
+        if (this.lastContextSwitch > 0 && (now - this.lastContextSwitch) < 60000) { // Less than 1 minute
+            this.sessionInterruptions++;
+            // Reset focus time if context switch is too frequent
+            this.focusStartTime = now;
+        }
+        this.lastContextSwitch = now;
+    }
+
+    private updateProjectStats(projectName: string, duration: number, focusTime: number, fileTypeStats: { [extension: string]: number }): void {
+        const project = this.projectData[projectName];
+        
+        // Update file type stats
+        Object.entries(fileTypeStats).forEach(([extension, time]) => {
+            project.fileTypeStats[extension] = (project.fileTypeStats[extension] || 0) + time;
+        });
+
+        // Update branch stats
+        if (this.currentGitBranch) {
+            project.branchStats[this.currentGitBranch] = (project.branchStats[this.currentGitBranch] || 0) + duration;
+        }
+
+        // Update productivity stats
+        project.productivity.totalSessions++;
+        project.productivity.averageFocusTime = 
+            (project.productivity.averageFocusTime * (project.productivity.totalSessions - 1) + focusTime) / 
+            project.productivity.totalSessions;
+        project.productivity.longestSession = Math.max(project.productivity.longestSession, duration);
+        project.productivity.interruptionCount += this.sessionInterruptions;
+    }
+
     // --- Helpers ---
     private updateCurrentProject(): void {
         const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -381,6 +638,19 @@ export class TimeTracker {
     private getDateString = (date: Date) => `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
     public registerDataChangeListener = (callback: () => void) => this.onDataChangedCallbacks.push(callback);
     private notifyDataChanged = () => this.onDataChangedCallbacks.forEach(cb => cb());
+
+    // --- Data Import/Export ---
+    public importData(projectData: { [projectName: string]: ProjectTime }, dailyData: { [date: string]: DailyRecord }): void {
+        // Validate and sanitize the imported data
+        if (typeof projectData === 'object' && typeof dailyData === 'object') {
+            this.projectData = { ...projectData };
+            this.dailyData = { ...dailyData };
+            this.saveData();
+            this.notifyDataChanged();
+        } else {
+            throw new Error('Invalid data format');
+        }
+    }
 
     public dispose(): void {
         this.stopTracking();

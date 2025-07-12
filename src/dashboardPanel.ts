@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { TimeTracker, ProjectTime, DailyRecord } from './timeTracker';
+import { AnalyticsEngine } from './analyticsEngine';
 
 /**
  * Manages the webview panel for the Project Timer dashboard
@@ -11,6 +12,7 @@ export class DashboardPanel {
     private readonly _timeTracker: TimeTracker;
     private _disposables: vscode.Disposable[] = [];
     private _updateInterval: NodeJS.Timeout | null = null;
+    private _analyticsEngine: AnalyticsEngine;
 
     /**
      * Creates or shows the dashboard panel
@@ -52,6 +54,12 @@ export class DashboardPanel {
         this._panel = panel;
         this._extensionUri = extensionUri;
         this._timeTracker = timeTracker;
+        
+        // Initialize analytics engine
+        this._analyticsEngine = new AnalyticsEngine(
+            this._timeTracker.getDailyData(),
+            this._timeTracker.getProjectData()
+        );
 
         // Set the webview's initial html content
         this._update();
@@ -96,6 +104,9 @@ export class DashboardPanel {
                         if (message.format) {
                             this._exportData(message.format);
                         }
+                        break;
+                    case 'importData':
+                        this._importData();
                         break;
                 }
             },
@@ -176,10 +187,82 @@ export class DashboardPanel {
         }
         
         if (content) {
-            vscode.env.clipboard.writeText(content).then(() => {
-                vscode.window.showInformationMessage(`Data exported to clipboard. Save as: ${filename}`);
+            // Try to use showSaveDialog if available, otherwise fall back to clipboard
+            vscode.window.showSaveDialog({
+                defaultUri: vscode.Uri.file(filename),
+                filters: format === 'json' ? 
+                    { 'JSON Files': ['json'], 'All Files': ['*'] } :
+                    { 'CSV Files': ['csv'], 'All Files': ['*'] }
+            }).then(uri => {
+                if (uri) {
+                    vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8')).then(() => {
+                        vscode.window.showInformationMessage(`Data exported successfully to ${uri.fsPath}`);
+                    }, (error) => {
+                        vscode.window.showErrorMessage(`Failed to export data: ${error.message}`);
+                        // Fallback to clipboard
+                        vscode.env.clipboard.writeText(content).then(() => {
+                            vscode.window.showInformationMessage(`Export failed, data copied to clipboard instead`);
+                        });
+                    });
+                } else {
+                    // User cancelled, offer clipboard option
+                    vscode.window.showInformationMessage('Export cancelled. Copy to clipboard instead?', 'Yes', 'No').then(response => {
+                        if (response === 'Yes') {
+                            vscode.env.clipboard.writeText(content).then(() => {
+                                vscode.window.showInformationMessage(`Data copied to clipboard`);
+                            });
+                        }
+                    });
+                }
             });
         }
+    }
+
+    /**
+     * Imports time data from a selected file
+     */
+    private _importData(): void {
+        vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: false,
+            filters: {
+                'Project Timer Files': ['json'],
+                'All Files': ['*']
+            },
+            openLabel: 'Import Data'
+        }).then(uris => {
+            if (uris && uris.length > 0) {
+                const uri = uris[0];
+                vscode.workspace.fs.readFile(uri).then(content => {
+                    try {
+                        const data = JSON.parse(content.toString());
+                        
+                        // Validate the data structure
+                        if (data.projects && data.daily) {
+                            // Show confirmation dialog
+                            vscode.window.showWarningMessage(
+                                'This will replace all current timer data. Are you sure?',
+                                { modal: true },
+                                'Import', 'Cancel'
+                            ).then(response => {
+                                if (response === 'Import') {
+                                    // Call import method on time tracker
+                                    this._timeTracker.importData(data.projects, data.daily);
+                                    vscode.window.showInformationMessage('Data imported successfully!');
+                                }
+                            });
+                        } else {
+                            vscode.window.showErrorMessage('Invalid file format. Expected Project Timer JSON export file.');
+                        }
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Failed to parse import file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    }
+                }, error => {
+                    vscode.window.showErrorMessage(`Failed to read file: ${error.message}`);
+                });
+            }
+        });
     }
 
     /**
@@ -344,6 +427,7 @@ export class DashboardPanel {
                     <div class="actions">
                         <button id="export-json-btn">Export as JSON</button>
                         <button id="export-csv-btn">Export as CSV</button>
+                        <button id="import-btn">Import Data</button>
                     </div>
                 </div>
 
@@ -370,6 +454,7 @@ export class DashboardPanel {
                     document.getElementById('reset-btn').addEventListener('click', () => vscode.postMessage({ command: 'resetToday' }));
                     document.getElementById('export-json-btn').addEventListener('click', () => vscode.postMessage({ command: 'exportData', format: 'json' }));
                     document.getElementById('export-csv-btn').addEventListener('click', () => vscode.postMessage({ command: 'exportData', format: 'csv' }));
+                    document.getElementById('import-btn').addEventListener('click', () => vscode.postMessage({ command: 'importData' }));
 
                     window.addEventListener('load', () => {
                         const weeklyCtx = document.getElementById('weekly-chart').getContext('2d');
